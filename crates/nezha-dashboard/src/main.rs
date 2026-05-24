@@ -51,6 +51,7 @@ const SERVICE_CURRENT_STATUS_SIZE: usize = 30;
 #[derive(Debug, clap::Subcommand)]
 enum DashboardCommand {
     SyncFrontends,
+    ResetAdminPassword,
 }
 
 #[derive(Debug, Parser)]
@@ -244,6 +245,12 @@ async fn main() -> Result<()> {
         for path in synced {
             println!("Synced {}", path.display());
         }
+        return Ok(());
+    }
+    if let Some(DashboardCommand::ResetAdminPassword) = args.command {
+        let store = store::Store::open(&args.data)?;
+        store.reset_admin_password(&args.admin_username, &args.admin_password)?;
+        println!("Admin password reset for {}", args.admin_username);
         return Ok(());
     }
     let file_config = read_dashboard_config_file(&args.config)?;

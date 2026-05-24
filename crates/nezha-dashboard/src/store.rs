@@ -466,6 +466,28 @@ impl Store {
         Ok(())
     }
 
+    pub fn reset_admin_password(&self, username: &str, password: &str) -> Result<()> {
+        anyhow::ensure!(!username.is_empty(), "username can't be empty");
+
+        let now = unix_now() as i64;
+        let password = hash(password, DEFAULT_COST).context("failed to hash admin password")?;
+        let changed = self.conn.execute(
+            "UPDATE users SET password = ?1, role = 0, reject_password = 0, updated_at_unix = ?2
+             WHERE username = ?3",
+            params![password, now, username],
+        )?;
+
+        if changed == 0 {
+            self.conn.execute(
+                "INSERT INTO users (username, password, role, agent_secret, reject_password, created_at_unix, updated_at_unix)
+                 VALUES (?1, ?2, 0, ?3, 0, ?4, ?4)",
+                params![username, password, generate_secret(), now],
+            )?;
+        }
+
+        Ok(())
+    }
+
     pub fn authenticate_user(&self, username: &str, password: &str) -> Result<Option<ApiUser>> {
         let row = self
             .conn
@@ -3185,6 +3207,46 @@ mod tests {
         assert_eq!(user.username, "admin");
         assert_eq!(user.role, 0);
         assert!(store.authenticate_user("admin", "bad").unwrap().is_none());
+    }
+
+    #[test]
+    fn bootstrap_admin_does_not_overwrite_existing_password() {
+        let store = Store::open(":memory:").unwrap();
+        store.ensure_admin("admin", "secret").unwrap();
+        store.ensure_admin("admin", "changed").unwrap();
+
+        assert!(
+            store
+                .authenticate_user("admin", "secret")
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .authenticate_user("admin", "changed")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn reset_admin_password_updates_existing_admin() {
+        let store = Store::open(":memory:").unwrap();
+        store.ensure_admin("admin", "secret").unwrap();
+        store.reset_admin_password("admin", "changed").unwrap();
+
+        assert!(
+            store
+                .authenticate_user("admin", "secret")
+                .unwrap()
+                .is_none()
+        );
+        let user = store
+            .authenticate_user("admin", "changed")
+            .unwrap()
+            .unwrap();
+        assert_eq!(user.username, "admin");
+        assert_eq!(user.role, 0);
     }
 
     #[test]
