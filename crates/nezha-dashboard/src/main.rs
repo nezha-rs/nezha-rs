@@ -263,8 +263,26 @@ async fn main() -> Result<()> {
     let resolved_config = resolve_dashboard_config(&args, &file_config)?;
     let store = store::Store::open(&args.data)?;
     store.ensure_admin(&args.admin_username, &args.admin_password)?;
-    if store.dashboard_settings()?.is_none() {
-        store.save_dashboard_settings(&resolved_config.initial_settings)?;
+    match store.dashboard_settings()? {
+        None => {
+            store.save_dashboard_settings(&resolved_config.initial_settings)?;
+        }
+        Some(mut existing) => {
+            let mut dirty = false;
+            if existing.install_host.is_empty()
+                && !resolved_config.initial_settings.install_host.is_empty()
+            {
+                existing.install_host = resolved_config.initial_settings.install_host.clone();
+                dirty = true;
+            }
+            if !existing.tls && resolved_config.initial_settings.tls {
+                existing.tls = true;
+                dirty = true;
+            }
+            if dirty {
+                store.save_dashboard_settings(&existing)?;
+            }
+        }
     }
     let service = DashboardService {
         state: Arc::new(DashboardState {
