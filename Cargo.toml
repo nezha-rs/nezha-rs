@@ -10,7 +10,7 @@ resolver = "3"
 [workspace.package]
 edition = "2024"
 license = "Apache-2.0"
-repository = "https://github.com/nezhahq/nezha-rs"
+repository = "https://github.com/nezha-rs/nezha-rs"
 rust-version = "1.95"
 version = "0.1.0"
 

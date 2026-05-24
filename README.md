@@ -32,7 +32,7 @@ cargo --version
 ## 获取源码
 
 ```bash
-git clone https://github.com/nezhahq/nezha-rs.git
+git clone https://github.com/nezha-rs/nezha-rs.git
 cd nezha-rs
 ```
 

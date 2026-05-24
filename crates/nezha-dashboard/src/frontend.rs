@@ -55,7 +55,7 @@ pub(crate) fn embedded_asset(relative_path: &str) -> Option<&'static [u8]> {
 pub(crate) async fn sync_frontends(static_dir: &Path) -> Result<Vec<PathBuf>> {
     let client = reqwest::Client::builder()
         .user_agent(format!(
-            "nezha-dashboard-rs/{} (+https://github.com/nezhahq/nezha-rs)",
+            "nezha-dashboard-rs/{} (+https://github.com/nezha-rs/nezha-rs)",
             env!("CARGO_PKG_VERSION")
         ))
         .build()
