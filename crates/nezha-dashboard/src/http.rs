@@ -909,7 +909,15 @@ async fn login(
     record_login_success(&state, &headers, user.id);
 
     match issue_token(&state, user.id, &user.username, user.role) {
-        Ok(response) => (StatusCode::OK, Json(CommonResponse::ok(response))).into_response(),
+        Ok(response) => (
+            StatusCode::OK,
+            [(
+                header::SET_COOKIE,
+                jwt_cookie(&response.token, state.jwt_timeout_hours),
+            )],
+            Json(CommonResponse::ok(response)),
+        )
+            .into_response(),
         Err(err) => api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
     }
 }
@@ -1134,7 +1142,15 @@ async fn refresh_token(State(state): State<HttpState>, headers: HeaderMap) -> im
         Err(err) => return api_error(StatusCode::OK, err.to_string()),
     };
     match issue_token(&state, claims.uid, &claims.username, claims.role) {
-        Ok(response) => (StatusCode::OK, Json(CommonResponse::ok(response))).into_response(),
+        Ok(response) => (
+            StatusCode::OK,
+            [(
+                header::SET_COOKIE,
+                jwt_cookie(&response.token, state.jwt_timeout_hours),
+            )],
+            Json(CommonResponse::ok(response)),
+        )
+            .into_response(),
         Err(err) => api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
     }
 }
@@ -4339,6 +4355,49 @@ mod tests {
         };
 
         let _router = router(state);
+    }
+
+    #[tokio::test]
+    async fn password_login_sets_jwt_cookie_for_admin_frontend() {
+        let state = HttpState {
+            dashboard: Arc::new(crate::DashboardState::new_for_test()),
+            jwt_secret: "secret".into(),
+            jwt_timeout_hours: 1,
+            site_name: "Nezha".into(),
+            debug: false,
+            force_auth: false,
+            agent_tls: false,
+            install_host: String::new(),
+            static_dir: PathBuf::from("static"),
+        };
+        state
+            .dashboard
+            .store
+            .lock()
+            .unwrap()
+            .ensure_admin("admin", "secret")
+            .unwrap();
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/login")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"username":"admin","password":"secret"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap();
+        assert!(cookie.starts_with("nz-jwt="));
+        assert!(cookie.contains("HttpOnly"));
     }
 
     #[tokio::test]
