@@ -1,2 +1,0 @@
-41eca76cbaf125c0a0f3ee7d91cd8c6822f077949883763b49779b8f6ec4af6b  dashboard-linux-amd64.zip
-bb614fcf72e8c5fbe053c0c4fac6817f5611854c9e81e99ccfb68f3bf0b6466f  dashboard-windows-amd64.zip
