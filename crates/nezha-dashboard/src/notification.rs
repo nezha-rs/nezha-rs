@@ -40,7 +40,7 @@ pub(crate) async fn send_notification(
     let client = Client::builder()
         .redirect(Policy::none())
         .timeout(std::time::Duration::from_secs(30))
-        .danger_accept_invalid_certs(!notification.verify_tls.unwrap_or(false))
+        .danger_accept_invalid_certs(!notification.verify_tls.unwrap_or(true))
         .build()
         .context("failed to build notification http client")?;
 

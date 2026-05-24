@@ -78,20 +78,23 @@ struct Args {
     #[arg(long, default_value = "admin", env = "NZ_ADMIN_PASSWORD")]
     admin_password: String,
 
-    #[arg(long, default_value = "nezha-rs", env = "NZ_JWT_SECRET")]
-    jwt_secret: String,
+    #[arg(long, env = "NZ_JWT_SECRET")]
+    jwt_secret: Option<String>,
 
-    #[arg(long, default_value_t = 1, env = "NZ_JWT_TIMEOUT")]
-    jwt_timeout: u64,
+    #[arg(long, env = "NZ_JWT_TIMEOUT")]
+    jwt_timeout: Option<u64>,
 
-    #[arg(long, default_value = "Nezha")]
-    site_name: String,
+    #[arg(long)]
+    site_name: Option<String>,
 
     #[arg(long, env = "NZ_DEBUG")]
     debug: bool,
 
     #[arg(long, env = "NZ_FORCE_AUTH")]
     force_auth: bool,
+
+    #[arg(long, env = "NZ_TRUST_PROXY_HEADERS")]
+    trust_proxy_headers: bool,
 
     #[arg(long, default_value = "")]
     install_host: String,
@@ -155,6 +158,8 @@ struct DashboardConfigFile {
     #[serde(default)]
     listen_port: Option<u16>,
     #[serde(default)]
+    trust_proxy_headers: Option<bool>,
+    #[serde(default)]
     oauth2: Option<HashMap<String, store::OAuth2Config>>,
 }
 
@@ -169,6 +174,7 @@ struct ResolvedDashboardConfig {
     force_auth: bool,
     agent_tls: bool,
     install_host: String,
+    trust_proxy_headers: bool,
     initial_settings: store::DashboardSettings,
 }
 
@@ -290,6 +296,7 @@ async fn main() -> Result<()> {
         agent_tls: resolved_config.agent_tls,
         install_host: resolved_config.install_host,
         static_dir: args.static_dir,
+        trust_proxy_headers: resolved_config.trust_proxy_headers,
     };
     let http_listener = TcpListener::bind(resolved_config.http_bind).await?;
     let http_router = http::router(http_state);
@@ -343,26 +350,22 @@ fn resolve_dashboard_config(
         .or_else(|| env::var("NZ_AGENT_SECRET_KEY").ok())
         .or_else(|| non_empty_opt(file.agent_secret_key.clone()))
         .unwrap_or_else(|| generated_secret(32));
-    let jwt_secret = if args.jwt_secret != "nezha-rs" {
-        args.jwt_secret.clone()
-    } else {
-        env::var("NZ_JWT_SECRET_KEY")
-            .ok()
-            .or_else(|| non_empty_opt(file.jwt_secret_key.clone()))
-            .unwrap_or_else(|| generated_secret(128))
-    };
-    let jwt_timeout = if args.jwt_timeout != 1 {
-        args.jwt_timeout
-    } else {
-        file.jwt_timeout.unwrap_or(1).max(1)
-    };
-    let site_name = if args.site_name != "Nezha" {
-        args.site_name.clone()
-    } else {
-        file.site_name
-            .clone()
-            .unwrap_or_else(|| "Nezha".to_string())
-    };
+    let jwt_secret = args
+        .jwt_secret
+        .clone()
+        .or_else(|| env::var("NZ_JWT_SECRET_KEY").ok())
+        .or_else(|| non_empty_opt(file.jwt_secret_key.clone()))
+        .unwrap_or_else(|| generated_secret(128));
+    let jwt_timeout = args
+        .jwt_timeout
+        .or(file.jwt_timeout)
+        .unwrap_or(1)
+        .max(1);
+    let site_name = args
+        .site_name
+        .clone()
+        .or_else(|| file.site_name.clone())
+        .unwrap_or_else(|| "Nezha".to_string());
     let install_host = if !args.install_host.is_empty() {
         args.install_host.clone()
     } else {
@@ -371,6 +374,7 @@ fn resolve_dashboard_config(
     let agent_tls = file.tls.unwrap_or(false);
     let debug = args.debug || file.debug.unwrap_or(false);
     let force_auth = args.force_auth || file.force_auth.unwrap_or(false);
+    let trust_proxy_headers = args.trust_proxy_headers || file.trust_proxy_headers.unwrap_or(false);
     let http_bind = if args.http_bind == default_http_bind() {
         config_http_bind(file)?
     } else {
@@ -388,6 +392,7 @@ fn resolve_dashboard_config(
         force_auth,
         agent_tls,
         install_host,
+        trust_proxy_headers,
         initial_settings,
     })
 }
@@ -1567,12 +1572,13 @@ mod tests {
             data: PathBuf::from("data/sqlite.db"),
             admin_username: "admin".to_string(),
             admin_password: "admin".to_string(),
-            jwt_secret: "nezha-rs".to_string(),
-            jwt_timeout: 1,
-            site_name: "Nezha".to_string(),
+            jwt_secret: None,
+            jwt_timeout: None,
+            site_name: None,
             debug: false,
             force_auth: false,
             install_host: String::new(),
+            trust_proxy_headers: false,
             static_dir: PathBuf::from("static"),
             geoip_db: PathBuf::from("data/geoip.db"),
             command: None,

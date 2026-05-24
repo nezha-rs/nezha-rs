@@ -1194,8 +1194,23 @@ async fn fm_upload(
         send_fm_error(tx, "data is invalid").await;
         return;
     }
-    let size = u64::from_be_bytes(first[1..9].try_into().unwrap_or_default());
+    let size_bytes: [u8; 8] = match first[1..9].try_into() {
+        Ok(arr) => arr,
+        Err(_) => {
+            send_fm_error(tx, "data is invalid").await;
+            return;
+        }
+    };
+    let size = u64::from_be_bytes(size_bytes);
     let path = String::from_utf8_lossy(&first[9..]).to_string();
+    if path.is_empty() {
+        send_fm_error(tx, "upload path is empty").await;
+        return;
+    }
+    if !is_safe_fm_path(&path) {
+        send_fm_error(tx, "upload path is not allowed").await;
+        return;
+    }
     let mut file = match tokio::fs::File::create(&path).await {
         Ok(file) => file,
         Err(err) => {
@@ -1239,6 +1254,21 @@ async fn send_fm_error(tx: &mpsc::Sender<IoStreamData>, error: &str) {
     let mut payload = FM_ERROR.to_vec();
     payload.extend_from_slice(error.as_bytes());
     let _ = tx.send(IoStreamData { data: payload }).await;
+}
+
+fn is_safe_fm_path(raw: &str) -> bool {
+    use std::path::{Component, Path};
+    let p = Path::new(raw);
+    if p.is_absolute() {
+        return false;
+    }
+    for comp in p.components() {
+        match comp {
+            Component::Normal(_) | Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return false,
+        }
+    }
+    true
 }
 
 fn create_fm_dir_payload_header(path: &str) -> Vec<u8> {

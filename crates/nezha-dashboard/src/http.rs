@@ -90,6 +90,10 @@ pub struct HttpState {
     pub agent_tls: bool,
     pub install_host: String,
     pub static_dir: PathBuf,
+    /// When false, x-forwarded-proto/x-forwarded-host/host headers are NOT trusted
+    /// for OAuth2 redirect URL generation — only `install_host`/`agent_tls` settings are used.
+    /// Enable only when the dashboard sits behind a known reverse proxy you control.
+    pub trust_proxy_headers: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -219,6 +223,14 @@ where
 }
 
 #[derive(Debug, Serialize)]
+struct AgentInstallCommandResponse {
+    command: String,
+    server: String,
+    tls: bool,
+    client_secret: String,
+}
+
+#[derive(Debug, Serialize)]
 struct ServerMetricsResponse {
     server_id: u64,
     #[serde(skip_serializing_if = "String::is_empty")]
@@ -245,6 +257,10 @@ struct OAuth2StateClaims {
     state: String,
     redirect_url: String,
     exp: usize,
+    #[serde(default = "oauth2_state_audience")]
+    aud: String,
+    #[serde(default = "jwt_issuer")]
+    iss: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -254,6 +270,26 @@ struct Claims {
     username: String,
     role: u8,
     exp: usize,
+    #[serde(default = "auth_audience")]
+    aud: String,
+    #[serde(default = "jwt_issuer")]
+    iss: String,
+}
+
+const JWT_ISSUER: &str = "nezha-rs";
+const JWT_AUDIENCE_AUTH: &str = "nezha:auth";
+const JWT_AUDIENCE_OAUTH2_STATE: &str = "nezha:oauth2-state";
+
+fn jwt_issuer() -> String {
+    JWT_ISSUER.to_string()
+}
+
+fn auth_audience() -> String {
+    JWT_AUDIENCE_AUTH.to_string()
+}
+
+fn oauth2_state_audience() -> String {
+    JWT_AUDIENCE_OAUTH2_STATE.to_string()
 }
 
 #[derive(Debug, Serialize)]
@@ -318,6 +354,7 @@ pub fn router(state: HttpState) -> Router {
         .route("/api/v1/file", get(create_file_manager))
         .route("/api/v1/ws/file/{id}", get(file_manager_stream))
         .route("/api/v1/profile", get(get_profile).post(update_profile))
+        .route("/api/v1/agent/install-command", get(agent_install_command))
         .route("/api/v1/user", get(list_users).post(create_user))
         .route("/api/v1/ws/server", get(server_stream))
         .route("/api/v1/batch-delete/user", post(batch_delete_user))
@@ -944,13 +981,15 @@ async fn oauth2_redirect(
     }
 
     let state_value = Uuid::new_v4().simple().to_string();
-    let redirect_url = oauth2_redirect_url(&headers);
+    let redirect_url = oauth2_redirect_url(&state, &headers);
     let state_claims = OAuth2StateClaims {
         action: query.r#type,
         provider: provider_key,
         state: state_value.clone(),
         redirect_url: redirect_url.clone(),
         exp: (unix_now() + 300) as usize,
+        aud: oauth2_state_audience(),
+        iss: jwt_issuer(),
     };
     let cookie = match encode_oauth2_state_cookie(&state, &state_claims) {
         Ok(cookie) => cookie,
@@ -1503,6 +1542,70 @@ async fn list_users(State(state): State<HttpState>, headers: HeaderMap) -> impl 
         },
         Err(_) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "store lock poisoned"),
     }
+}
+
+async fn agent_install_command(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let claims = match require_auth(&state, &headers) {
+        Ok(claims) => claims,
+        Err(err) => return api_error(StatusCode::OK, err.to_string()),
+    };
+
+    let (agent_secret, settings) = match state.dashboard.store.lock() {
+        Ok(store) => {
+            let user = match store.get_user(claims.uid) {
+                Ok(user) => user,
+                Err(err) => return api_error(StatusCode::OK, err.to_string()),
+            };
+            let settings = store
+                .dashboard_settings()
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| settings_from_state_defaults(&state));
+            (user.agent_secret, settings)
+        }
+        Err(_) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, "store lock poisoned"),
+    };
+
+    let server = if !settings.install_host.is_empty() {
+        settings.install_host.clone()
+    } else {
+        state.install_host.clone()
+    };
+    if server.is_empty() {
+        return api_error(
+            StatusCode::OK,
+            "install_host is not configured; set it in dashboard settings first",
+        );
+    }
+    let tls = settings.tls || state.agent_tls;
+    let script_url =
+        "https://raw.githubusercontent.com/nezha-rs/scripts/main/install-agent.sh";
+    let command = format!(
+        "curl -L {script} -o /tmp/nezha-agent.sh && env NZ_SERVER={server} NZ_TLS={tls} NZ_CLIENT_SECRET={secret} sh /tmp/nezha-agent.sh install",
+        script = script_url,
+        server = shell_single_quote(&server),
+        tls = tls,
+        secret = shell_single_quote(&agent_secret),
+    );
+
+    (
+        StatusCode::OK,
+        Json(CommonResponse::ok(AgentInstallCommandResponse {
+            command,
+            server,
+            tls,
+            client_secret: agent_secret,
+        })),
+    )
+        .into_response()
+}
+
+fn shell_single_quote(raw: &str) -> String {
+    let escaped = raw.replace('\'', "'\\''");
+    format!("'{escaped}'")
 }
 
 async fn create_user(
@@ -3548,6 +3651,8 @@ fn issue_token(state: &HttpState, uid: u64, username: &str, role: u8) -> Result<
         username: username.to_string(),
         role,
         exp: exp as usize,
+        aud: auth_audience(),
+        iss: jwt_issuer(),
     };
     let token = encode(
         &Header::new(Algorithm::HS256),
@@ -3592,7 +3697,15 @@ fn validate_oauth2_config(config: &OAuth2Config) -> Result<()> {
     Ok(())
 }
 
-fn oauth2_redirect_url(headers: &HeaderMap) -> String {
+fn oauth2_redirect_url(state: &HttpState, headers: &HeaderMap) -> String {
+    if !state.install_host.is_empty() {
+        let scheme = if state.agent_tls { "https" } else { "http" };
+        return format!("{scheme}://{}/api/v1/oauth2/callback", state.install_host);
+    }
+    if !state.trust_proxy_headers {
+        let scheme = if state.agent_tls { "https" } else { "http" };
+        return format!("{scheme}://localhost/api/v1/oauth2/callback");
+    }
     let scheme = headers
         .get("x-forwarded-proto")
         .and_then(|value| value.to_str().ok())
@@ -3607,8 +3720,9 @@ fn oauth2_redirect_url(headers: &HeaderMap) -> String {
         })
         .unwrap_or("http");
     let host = headers
-        .get("host")
+        .get("x-forwarded-host")
         .and_then(|value| value.to_str().ok())
+        .or_else(|| headers.get("host").and_then(|value| value.to_str().ok()))
         .unwrap_or("localhost");
     format!("{scheme}://{host}/api/v1/oauth2/callback")
 }
@@ -3643,10 +3757,13 @@ fn encode_oauth2_state_cookie(state: &HttpState, claims: &OAuth2StateClaims) -> 
 
 fn oauth2_state_from_headers(state: &HttpState, headers: &HeaderMap) -> Result<OAuth2StateClaims> {
     let token = cookie_value(headers, "nz-o2s").context("invalid state key")?;
+    let mut validation = Validation::new(Algorithm::HS256);
+    validation.set_issuer(&[JWT_ISSUER]);
+    validation.set_audience(&[JWT_AUDIENCE_OAUTH2_STATE]);
     Ok(decode::<OAuth2StateClaims>(
         &token,
         &DecodingKey::from_secret(state.jwt_secret.as_bytes()),
-        &Validation::new(Algorithm::HS256),
+        &validation,
     )
     .context("invalid state key")?
     .claims)
@@ -3913,10 +4030,13 @@ fn cookie_value(headers: &HeaderMap, target: &str) -> Option<String> {
 }
 
 fn decode_token(state: &HttpState, token: &str) -> Result<Claims> {
+    let mut validation = Validation::new(Algorithm::HS256);
+    validation.set_issuer(&[JWT_ISSUER]);
+    validation.set_audience(&[JWT_AUDIENCE_AUTH]);
     let claims = decode::<Claims>(
         token,
         &DecodingKey::from_secret(state.jwt_secret.as_bytes()),
-        &Validation::new(Algorithm::HS256),
+        &validation,
     )
     .context("unauthorized")?
     .claims;
@@ -3972,6 +4092,7 @@ mod tests {
             agent_tls: false,
             install_host: String::new(),
             static_dir: PathBuf::from("static"),
+            trust_proxy_headers: false,
         };
 
         let token = issue_token(&state, 1, "admin", 0).unwrap().token;
@@ -3996,6 +4117,7 @@ mod tests {
             agent_tls: false,
             install_host: String::new(),
             static_dir: PathBuf::from("static"),
+            trust_proxy_headers: false,
         };
 
         let token = issue_token(&state, 2, "member", 1).unwrap().token;
@@ -4020,6 +4142,7 @@ mod tests {
             agent_tls: false,
             install_host: String::new(),
             static_dir: PathBuf::from("static"),
+            trust_proxy_headers: false,
         };
         let server_id = {
             let store = state.dashboard.store.lock().unwrap();
@@ -4052,6 +4175,8 @@ mod tests {
             username: "member".into(),
             role: 1,
             exp: usize::MAX,
+            aud: auth_audience(),
+            iss: jwt_issuer(),
         };
         state
             .dashboard
@@ -4081,6 +4206,7 @@ mod tests {
             agent_tls: false,
             install_host: String::new(),
             static_dir: PathBuf::from("static"),
+            trust_proxy_headers: false,
         };
         let server_id = {
             let store = state.dashboard.store.lock().unwrap();
@@ -4096,6 +4222,8 @@ mod tests {
             username: "alice".into(),
             role: 1,
             exp: usize::MAX,
+            aud: auth_audience(),
+            iss: jwt_issuer(),
         };
         let foreign = Claims {
             sub: "200".into(),
@@ -4103,6 +4231,8 @@ mod tests {
             username: "bob".into(),
             role: 1,
             exp: usize::MAX,
+            aud: auth_audience(),
+            iss: jwt_issuer(),
         };
         let admin = Claims {
             sub: "1".into(),
@@ -4110,6 +4240,8 @@ mod tests {
             username: "admin".into(),
             role: 0,
             exp: usize::MAX,
+            aud: auth_audience(),
+            iss: jwt_issuer(),
         };
 
         assert!(user_can_manage_server(&state, &owner, server_id).unwrap());
@@ -4157,6 +4289,8 @@ mod tests {
             username: "alice".into(),
             role: 1,
             exp: usize::MAX,
+            aud: auth_audience(),
+            iss: jwt_issuer(),
         };
         let admin = Claims {
             sub: "1".into(),
@@ -4164,6 +4298,8 @@ mod tests {
             username: "admin".into(),
             role: 0,
             exp: usize::MAX,
+            aud: auth_audience(),
+            iss: jwt_issuer(),
         };
 
         let visible = filter_owned(store.list_servers().unwrap(), &alice, |server| {
@@ -4231,6 +4367,8 @@ mod tests {
             username: "owner".into(),
             role: 1,
             exp: usize::MAX,
+            aud: auth_audience(),
+            iss: jwt_issuer(),
         };
         let foreign = Claims {
             sub: "300".into(),
@@ -4238,6 +4376,8 @@ mod tests {
             username: "foreign".into(),
             role: 1,
             exp: usize::MAX,
+            aud: auth_audience(),
+            iss: jwt_issuer(),
         };
         let admin = Claims {
             sub: "1".into(),
@@ -4245,6 +4385,8 @@ mod tests {
             username: "admin".into(),
             role: 0,
             exp: usize::MAX,
+            aud: auth_audience(),
+            iss: jwt_issuer(),
         };
 
         assert!(!user_can_view_server(None, hidden));
@@ -4293,6 +4435,8 @@ mod tests {
             username: "admin".into(),
             role: 0,
             exp: usize::MAX,
+            aud: auth_audience(),
+            iss: jwt_issuer(),
         };
 
         let guest = serde_json::to_value(setting_response(&settings, None)).unwrap();
@@ -4352,6 +4496,7 @@ mod tests {
             agent_tls: false,
             install_host: String::new(),
             static_dir: PathBuf::from("static"),
+            trust_proxy_headers: false,
         };
 
         let _router = router(state);
@@ -4369,6 +4514,7 @@ mod tests {
             agent_tls: false,
             install_host: String::new(),
             static_dir: PathBuf::from("static"),
+            trust_proxy_headers: false,
         };
         state
             .dashboard
@@ -4429,6 +4575,7 @@ mod tests {
             agent_tls: false,
             install_host: String::new(),
             static_dir: static_dir.clone(),
+            trust_proxy_headers: false,
         };
         state
             .dashboard
@@ -4500,6 +4647,7 @@ mod tests {
             agent_tls: false,
             install_host: String::new(),
             static_dir: static_dir.clone(),
+            trust_proxy_headers: false,
         };
         state
             .dashboard
@@ -4556,6 +4704,7 @@ mod tests {
             agent_tls: false,
             install_host: String::new(),
             static_dir: PathBuf::from("__missing_static_dir__"),
+            trust_proxy_headers: false,
         };
 
         let user = frontend_fallback(
@@ -4604,6 +4753,7 @@ mod tests {
             agent_tls: false,
             install_host: String::new(),
             static_dir: PathBuf::from("static"),
+            trust_proxy_headers: false,
         };
 
         let redirect = frontend_fallback(
@@ -4672,6 +4822,7 @@ mod tests {
             agent_tls: false,
             install_host: String::new(),
             static_dir: PathBuf::from("__missing_static_dir__"),
+            trust_proxy_headers: false,
         };
         let enabled = HttpState {
             debug: true,
@@ -4825,6 +4976,7 @@ mod tests {
             agent_tls: false,
             install_host: String::new(),
             static_dir: PathBuf::from("static"),
+            trust_proxy_headers: true,
         };
         let headers = HeaderMap::from_iter([
             (header::HOST, "dash.example.com".parse().unwrap()),
@@ -4833,7 +4985,7 @@ mod tests {
                 "https".parse().unwrap(),
             ),
         ]);
-        let redirect_url = oauth2_redirect_url(&headers);
+        let redirect_url = oauth2_redirect_url(&state, &headers);
         let config = OAuth2Config {
             client_id: "client id".into(),
             client_secret: "secret".into(),
@@ -4866,6 +5018,8 @@ mod tests {
                 state: "state-1".into(),
                 redirect_url,
                 exp: (unix_now() + 300) as usize,
+                aud: oauth2_state_audience(),
+                iss: jwt_issuer(),
             },
         )
         .unwrap();
