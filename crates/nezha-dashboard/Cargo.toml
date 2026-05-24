@@ -1,0 +1,42 @@
+[package]
+name = "nezha-dashboard"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-stream.workspace = true
+axum.workspace = true
+bcrypt.workspace = true
+chrono.workspace = true
+clap.workspace = true
+cron.workspace = true
+futures-util.workspace = true
+hmac = "0.12.1"
+include_dir = "0.7.4"
+jsonwebtoken.workspace = true
+maxminddb.workspace = true
+nezha-core = { path = "../nezha-core" }
+nezha-proto = { path = "../nezha-proto" }
+reqwest.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+sha2 = "0.10.9"
+tokio.workspace = true
+tokio-stream.workspace = true
+tonic.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+zip = { version = "0.6.6", default-features = false, features = ["deflate"] }
+
+[build-dependencies]
+serde_json.workspace = true
+
+[dev-dependencies]
+tower = { version = "0.5.2", features = ["util"] }

@@ -1,0 +1,16 @@
+[package]
+name = "nezha-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+nezha-proto = { path = "../nezha-proto" }
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+uuid.workspace = true

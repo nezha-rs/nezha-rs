@@ -1,0 +1,10 @@
+/target/
+/upstream/
+/data/
+/.env
+/.env.*
+/config.yml
+/config.yaml
+*.db
+*.log
+.DS_Store
