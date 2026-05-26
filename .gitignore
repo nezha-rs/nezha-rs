@@ -2,6 +2,7 @@
 /upstream/
 /data/
 /dist/
+/dist-release/
 /.env
 /.env.*
 /config.yml

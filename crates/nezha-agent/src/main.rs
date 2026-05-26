@@ -925,14 +925,18 @@ async fn run_terminal_stream(cfg: AgentConfig, data: &str) -> Result<()> {
                         break;
                     }
                 }
-                Err(_) => break,
+                Err(err) => {
+                    warn!(error = %err, "terminal pty read failed");
+                    break;
+                }
             }
         }
     });
     let to_agent_tx = tx.clone();
     let output_task = tokio::spawn(async move {
         while let Some(data) = pty_rx.recv().await {
-            if to_agent_tx.send(IoStreamData { data }).await.is_err() {
+            if let Err(err) = to_agent_tx.send(IoStreamData { data }).await {
+                warn!(error = %err, "terminal output forward failed");
                 break;
             }
         }
@@ -950,8 +954,8 @@ async fn run_terminal_stream(cfg: AgentConfig, data: &str) -> Result<()> {
                 if let Some(size) = parse_terminal_resize(&data.data[1..]) {
                     pair.master.resize(size)?;
                 } else {
-                    writer.write_all(&data.data)?;
-                    writer.flush()?;
+                    warn!("invalid terminal resize frame, dropping");
+                    continue;
                 }
             }
             _ => {
@@ -961,6 +965,11 @@ async fn run_terminal_stream(cfg: AgentConfig, data: &str) -> Result<()> {
         }
     }
     let _ = child.kill();
+    let _ = tokio::task::spawn_blocking(move || {
+        let mut child = child;
+        let _ = child.wait();
+    })
+    .await;
     let _ = reader_task.await;
     output_task.abort();
     Ok(())

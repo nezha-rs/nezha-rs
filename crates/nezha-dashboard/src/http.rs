@@ -1447,6 +1447,10 @@ async fn bridge_websocket_stream(
         return;
     };
     let (mut ws_tx, mut ws_rx) = socket.split();
+    let mut ping_interval = tokio::time::interval(Duration::from_secs(10));
+    ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Burn the immediate first tick so we don't ping right after the upgrade.
+    ping_interval.tick().await;
     loop {
         tokio::select! {
             message = ws_rx.next() => {
@@ -1471,6 +1475,11 @@ async fn bridge_websocket_stream(
                     continue;
                 }
                 if ws_tx.send(Message::Binary(data.into())).await.is_err() {
+                    break;
+                }
+            }
+            _ = ping_interval.tick() => {
+                if ws_tx.send(Message::Ping(Vec::new().into())).await.is_err() {
                     break;
                 }
             }
