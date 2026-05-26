@@ -1,11 +1,12 @@
 use std::{
     collections::HashSet,
     process::{Command, Stdio},
+    sync::{Mutex, OnceLock},
     thread,
     time::{Duration, Instant},
 };
 #[cfg(target_os = "linux")]
-use std::{path::Path, sync::OnceLock};
+use std::path::Path;
 
 use nezha_core::AgentConfig;
 use nezha_proto::{Host, State, StateSensorTemperature};
@@ -156,20 +157,26 @@ impl Monitor {
     }
 
     fn network_totals(&self, elapsed_secs: u64) -> (u64, u64, u64, u64) {
-        self.networks
+        let elapsed = elapsed_secs.max(1);
+        let (rx_total, tx_total, rx_bytes, tx_bytes) = self
+            .networks
             .iter()
             .filter(|(name, _)| {
                 self.nic_allowlist.is_empty()
                     || self.nic_allowlist.contains(&name.to_ascii_lowercase())
             })
-            .fold((0, 0, 0, 0), |(rx_total, tx_total, rx, tx), (_, net)| {
-                (
-                    rx_total + net.total_received(),
-                    tx_total + net.total_transmitted(),
-                    rx + net.received() / elapsed_secs,
-                    tx + net.transmitted() / elapsed_secs,
-                )
-            })
+            .fold(
+                (0u64, 0u64, 0u64, 0u64),
+                |(rx_total, tx_total, rx_bytes, tx_bytes), (_, net)| {
+                    (
+                        rx_total.saturating_add(net.total_received()),
+                        tx_total.saturating_add(net.total_transmitted()),
+                        rx_bytes.saturating_add(net.received()),
+                        tx_bytes.saturating_add(net.transmitted()),
+                    )
+                },
+            );
+        (rx_total, tx_total, rx_bytes / elapsed, tx_bytes / elapsed)
     }
 
     fn temperatures(&mut self) -> Vec<StateSensorTemperature> {
@@ -387,7 +394,34 @@ fn lines_contain(lines: &[String], needle: &str) -> bool {
     lines.iter().any(|line| line.contains(needle))
 }
 
+const GPU_CACHE_TTL: Duration = Duration::from_secs(5);
+static GPU_MODELS_CACHE: OnceLock<Mutex<Option<(Instant, Vec<String>)>>> = OnceLock::new();
+static GPU_USAGE_CACHE: OnceLock<Mutex<Option<(Instant, Vec<f64>)>>> = OnceLock::new();
+
+fn cached_or_sample<T: Clone>(
+    cache: &OnceLock<Mutex<Option<(Instant, T)>>>,
+    sampler: impl FnOnce() -> T,
+) -> T {
+    let cell = cache.get_or_init(|| Mutex::new(None));
+    if let Ok(guard) = cell.lock() {
+        if let Some((ts, value)) = guard.as_ref() {
+            if ts.elapsed() < GPU_CACHE_TTL {
+                return value.clone();
+            }
+        }
+    }
+    let sampled = sampler();
+    if let Ok(mut guard) = cell.lock() {
+        *guard = Some((Instant::now(), sampled.clone()));
+    }
+    sampled
+}
+
 fn gpu_models() -> Vec<String> {
+    cached_or_sample(&GPU_MODELS_CACHE, sample_gpu_models)
+}
+
+fn sample_gpu_models() -> Vec<String> {
     nvidia_smi_xml()
         .map(|raw| parse_nvidia_models(&raw))
         .filter(|items| !items.is_empty())
@@ -401,6 +435,10 @@ fn gpu_models() -> Vec<String> {
 }
 
 fn gpu_usage() -> Vec<f64> {
+    cached_or_sample(&GPU_USAGE_CACHE, sample_gpu_usage)
+}
+
+fn sample_gpu_usage() -> Vec<f64> {
     nvidia_smi_xml()
         .map(|raw| parse_nvidia_usage(&raw))
         .filter(|items| !items.is_empty())

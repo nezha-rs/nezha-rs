@@ -11,9 +11,29 @@ use nezha_core::{
 };
 use nezha_proto::{GeoIp, Host, State, TaskResult};
 use rusqlite::{Connection, OptionalExtension, params};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
 use uuid::Uuid;
+
+pub(crate) fn serialize_unix_as_rfc3339<S: Serializer>(v: &u64, s: S) -> Result<S::Ok, S::Error> {
+    if *v == 0 {
+        return s.serialize_str("0001-01-01T00:00:00Z");
+    }
+    match DateTime::<Utc>::from_timestamp(*v as i64, 0) {
+        Some(dt) => s.serialize_str(&dt.format("%Y-%m-%dT%H:%M:%SZ").to_string()),
+        None => s.serialize_str("0001-01-01T00:00:00Z"),
+    }
+}
+
+pub(crate) fn serialize_unix_opt_as_rfc3339<S: Serializer>(
+    v: &Option<u64>,
+    s: S,
+) -> Result<S::Ok, S::Error> {
+    match v {
+        Some(t) => serialize_unix_as_rfc3339(t, s),
+        None => s.serialize_str("0001-01-01T00:00:00Z"),
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct StoredServer {
@@ -41,7 +61,9 @@ pub struct UserResource {
     pub role: u8,
     pub agent_secret: String,
     pub reject_password: bool,
+    #[serde(serialize_with = "serialize_unix_as_rfc3339")]
     pub created_at: u64,
+    #[serde(serialize_with = "serialize_unix_as_rfc3339")]
     pub updated_at: u64,
 }
 
@@ -56,7 +78,7 @@ pub struct ProfileResource {
     pub oauth2_bind: HashMap<String, String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct PublicServer {
     pub id: u64,
     pub user_id: u64,
@@ -73,10 +95,45 @@ pub struct PublicServer {
     pub state: Option<CoreHostState>,
     pub geoip: Option<CoreGeoIp>,
     pub last_active: u64,
-    #[serde(skip_serializing)]
     pub prev_transfer_in_snapshot: u64,
-    #[serde(skip_serializing)]
     pub prev_transfer_out_snapshot: u64,
+}
+
+impl Serialize for PublicServer {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut s = serializer.serialize_struct("PublicServer", 16)?;
+        s.serialize_field("id", &self.id)?;
+        s.serialize_field("user_id", &self.user_id)?;
+        s.serialize_field("uuid", &self.uuid)?;
+        s.serialize_field("name", &self.name)?;
+        s.serialize_field("note", &self.note)?;
+        s.serialize_field("public_note", &self.public_note)?;
+        s.serialize_field("display_index", &self.display_index)?;
+        s.serialize_field("hide_for_guest", &self.hide_for_guest)?;
+        s.serialize_field("enable_ddns", &self.enable_ddns)?;
+        s.serialize_field("ddns_profiles", &self.ddns_profiles)?;
+        s.serialize_field("override_ddns_domains", &self.override_ddns_domains)?;
+        s.serialize_field("host", &self.host)?;
+        s.serialize_field("state", &self.state)?;
+        s.serialize_field("geoip", &self.geoip)?;
+        let country_code = self
+            .geoip
+            .as_ref()
+            .map(|g| g.country_code.as_str())
+            .unwrap_or("");
+        s.serialize_field("country_code", country_code)?;
+        s.serialize_field("last_active", &UnixRfc3339Ser(&self.last_active))?;
+        s.end()
+    }
+}
+
+struct UnixRfc3339Ser<'a>(&'a u64);
+
+impl<'a> Serialize for UnixRfc3339Ser<'a> {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        serialize_unix_as_rfc3339(self.0, s)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -84,7 +141,9 @@ pub struct NamedResource {
     pub id: u64,
     pub name: String,
     pub user_id: u64,
+    #[serde(serialize_with = "serialize_unix_as_rfc3339")]
     pub created_at: u64,
+    #[serde(serialize_with = "serialize_unix_as_rfc3339")]
     pub updated_at: u64,
 }
 
@@ -112,7 +171,10 @@ pub struct NotificationResource {
     pub request_body: String,
     pub verify_tls: Option<bool>,
     pub format_metric_units: Option<bool>,
+    pub skip_check: Option<bool>,
+    #[serde(serialize_with = "serialize_unix_as_rfc3339")]
     pub created_at: u64,
+    #[serde(serialize_with = "serialize_unix_as_rfc3339")]
     pub updated_at: u64,
 }
 
@@ -127,10 +189,13 @@ pub struct CronResource {
     pub servers: Vec<u64>,
     pub push_successful: bool,
     pub notification_group_id: u64,
+    #[serde(serialize_with = "serialize_unix_opt_as_rfc3339")]
     pub last_executed_at: Option<u64>,
     pub last_result: bool,
     pub cover: u8,
+    #[serde(serialize_with = "serialize_unix_as_rfc3339")]
     pub created_at: u64,
+    #[serde(serialize_with = "serialize_unix_as_rfc3339")]
     pub updated_at: u64,
 }
 
@@ -143,7 +208,9 @@ pub struct NatResource {
     pub server_id: u64,
     pub host: String,
     pub domain: String,
+    #[serde(serialize_with = "serialize_unix_as_rfc3339")]
     pub created_at: u64,
+    #[serde(serialize_with = "serialize_unix_as_rfc3339")]
     pub updated_at: u64,
 }
 
@@ -168,11 +235,13 @@ pub struct ServiceResource {
     pub latency_notify: bool,
     pub skip_servers: serde_json::Map<String, Value>,
     pub trigger_tasks: serde_json::Map<String, Value>,
+    #[serde(serialize_with = "serialize_unix_as_rfc3339")]
     pub created_at: u64,
+    #[serde(serialize_with = "serialize_unix_as_rfc3339")]
     pub updated_at: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct DdnsResource {
     pub id: u64,
     pub user_id: u64,
@@ -182,6 +251,39 @@ pub struct DdnsResource {
     pub body: Value,
     pub created_at: u64,
     pub updated_at: u64,
+}
+
+impl Serialize for DdnsResource {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let extra_len = self.body.as_object().map(|m| m.len()).unwrap_or(0);
+        let mut m = serializer.serialize_map(Some(7 + extra_len))?;
+        m.serialize_entry("id", &self.id)?;
+        m.serialize_entry("user_id", &self.user_id)?;
+        m.serialize_entry("name", &self.name)?;
+        m.serialize_entry("provider", &self.provider)?;
+        m.serialize_entry("domains", &self.domains)?;
+        if let Some(obj) = self.body.as_object() {
+            const RESERVED: &[&str] = &[
+                "id",
+                "user_id",
+                "name",
+                "provider",
+                "domains",
+                "created_at",
+                "updated_at",
+            ];
+            for (k, v) in obj {
+                if RESERVED.contains(&k.as_str()) {
+                    continue;
+                }
+                m.serialize_entry(k, v)?;
+            }
+        }
+        m.serialize_entry("created_at", &UnixRfc3339Ser(&self.created_at))?;
+        m.serialize_entry("updated_at", &UnixRfc3339Ser(&self.updated_at))?;
+        m.end()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -195,7 +297,11 @@ pub struct AlertRuleResource {
     pub rules: Vec<Value>,
     pub fail_trigger_tasks: Vec<u64>,
     pub recover_trigger_tasks: Vec<u64>,
+    #[serde(default)]
+    pub muted_until: u64,
+    #[serde(serialize_with = "serialize_unix_as_rfc3339")]
     pub created_at: u64,
+    #[serde(serialize_with = "serialize_unix_as_rfc3339")]
     pub updated_at: u64,
 }
 
@@ -206,6 +312,25 @@ pub struct WafResource {
     pub block_reason: u8,
     pub block_timestamp: u64,
     pub count: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingTask {
+    pub row_id: i64,
+    pub task_id: u64,
+    pub task_type: u64,
+    pub data: String,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationDeadLetterEntry {
+    pub id: u64,
+    pub notification_id: u64,
+    pub message: String,
+    pub error: String,
+    pub attempts: u32,
+    pub created_at_unix: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -266,6 +391,7 @@ pub struct ServiceInfo {
     pub display_index: i32,
     pub created_at: Vec<i64>,
     pub avg_delay: Vec<f64>,
+    pub packet_loss: Vec<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -318,6 +444,10 @@ pub struct DashboardSettings {
     pub enable_plain_ip_in_notification: bool,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub oauth2: HashMap<String, OAuth2Config>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub client_secret: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub jwt_secret: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -357,6 +487,8 @@ impl Default for DashboardSettings {
             enable_ip_change_notification: false,
             enable_plain_ip_in_notification: false,
             oauth2: HashMap::new(),
+            client_secret: String::new(),
+            jwt_secret: String::new(),
         }
     }
 }
@@ -618,17 +750,30 @@ impl Store {
     pub fn delete_servers(&self, ids: &[u64]) -> Result<usize> {
         let mut deleted = 0;
         for id in ids {
+            let sid = *id as i64;
             deleted += self
                 .conn
-                .execute("DELETE FROM servers WHERE id = ?1", params![*id as i64])?;
+                .execute("DELETE FROM servers WHERE id = ?1", params![sid])?;
             self.conn.execute(
                 "DELETE FROM server_group_servers WHERE server_id = ?1",
-                params![*id as i64],
+                params![sid],
+            )?;
+            self.conn
+                .execute("DELETE FROM transfers WHERE server_id = ?1", params![sid])?;
+            self.conn.execute(
+                "DELETE FROM service_history WHERE server_id = ?1",
+                params![sid],
             )?;
             self.conn.execute(
-                "DELETE FROM transfers WHERE server_id = ?1",
-                params![*id as i64],
+                "DELETE FROM server_metrics WHERE server_id = ?1",
+                params![sid],
             )?;
+            self.conn.execute(
+                "DELETE FROM pending_tasks WHERE server_id = ?1",
+                params![sid],
+            )?;
+            self.conn
+                .execute("DELETE FROM nat WHERE server_id = ?1", params![sid])?;
         }
         Ok(deleted)
     }
@@ -858,7 +1003,8 @@ impl Store {
     pub fn list_notifications(&self) -> Result<Vec<NotificationResource>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, user_id, name, url, request_method, request_type, request_header,
-                    request_body, verify_tls, format_metric_units, created_at_unix, updated_at_unix
+                    request_body, verify_tls, format_metric_units, skip_check,
+                    created_at_unix, updated_at_unix
              FROM notifications ORDER BY id ASC",
         )?;
         let rows = stmt
@@ -882,12 +1028,13 @@ impl Store {
         let request_body = string_field(body, "request_body");
         let verify_tls = opt_bool_i64(body, "verify_tls");
         let format_metric_units = opt_bool_i64(body, "format_metric_units");
+        let skip_check = opt_bool_i64(body, "skip_check");
 
         let id = if let Some(id) = id {
             self.conn.execute(
                 "UPDATE notifications SET name=?1, url=?2, request_method=?3, request_type=?4,
                  request_header=?5, request_body=?6, verify_tls=?7, format_metric_units=?8,
-                 updated_at_unix=?9 WHERE id=?10",
+                 skip_check=?9, updated_at_unix=?10 WHERE id=?11",
                 params![
                     name,
                     url,
@@ -897,6 +1044,7 @@ impl Store {
                     request_body,
                     verify_tls,
                     format_metric_units,
+                    skip_check,
                     now,
                     id as i64
                 ],
@@ -906,8 +1054,8 @@ impl Store {
             self.conn.execute(
                 "INSERT INTO notifications
                  (user_id, name, url, request_method, request_type, request_header, request_body,
-                  verify_tls, format_metric_units, created_at_unix, updated_at_unix)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
+                  verify_tls, format_metric_units, skip_check, created_at_unix, updated_at_unix)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)",
                 params![
                     user_id as i64,
                     name,
@@ -918,6 +1066,7 @@ impl Store {
                     request_body,
                     verify_tls,
                     format_metric_units,
+                    skip_check,
                     now
                 ],
             )?;
@@ -1047,7 +1196,7 @@ impl Store {
         let mut stmt = self.conn.prepare(
             "SELECT n.id, n.user_id, n.name, n.url, n.request_method, n.request_type,
                     n.request_header, n.request_body, n.verify_tls, n.format_metric_units,
-                    n.created_at_unix, n.updated_at_unix
+                    n.skip_check, n.created_at_unix, n.updated_at_unix
              FROM notifications n
              JOIN notification_group_notifications ngn ON ngn.notification_id = n.id
              WHERE ngn.notification_group_id = ?1
@@ -1303,6 +1452,85 @@ impl Store {
         Ok(())
     }
 
+    pub fn enqueue_pending_task(
+        &self,
+        server_id: u64,
+        task_id: u64,
+        task_type: u64,
+        data: &str,
+    ) -> Result<()> {
+        let now = unix_now() as i64;
+        self.conn.execute(
+            "INSERT INTO pending_tasks (server_id, task_id, task_type, data, created_at_unix)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![server_id as i64, task_id as i64, task_type as i64, data, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn drain_pending_tasks(&self, server_id: u64) -> Result<Vec<PendingTask>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, task_id, task_type, data
+             FROM pending_tasks WHERE server_id = ?1 ORDER BY id ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![server_id as i64], |row| {
+                Ok(PendingTask {
+                    row_id: row.get::<_, i64>(0)?,
+                    task_id: row.get::<_, i64>(1)? as u64,
+                    task_type: row.get::<_, i64>(2)? as u64,
+                    data: row.get::<_, String>(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn delete_pending_task(&self, row_id: i64) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM pending_tasks WHERE id = ?1",
+            params![row_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn record_notification_dead_letter(
+        &self,
+        notification_id: u64,
+        message: &str,
+        error: &str,
+        attempts: u32,
+    ) -> Result<()> {
+        let now = unix_now() as i64;
+        self.conn.execute(
+            "INSERT INTO notification_dead_letter (notification_id, message, error, attempts, created_at_unix)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![notification_id as i64, message, error, attempts as i64, now],
+        )?;
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub fn list_notification_dead_letter(&self) -> Result<Vec<NotificationDeadLetterEntry>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, notification_id, message, error, attempts, created_at_unix
+             FROM notification_dead_letter ORDER BY id DESC LIMIT 500",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(NotificationDeadLetterEntry {
+                    id: row.get::<_, i64>(0)? as u64,
+                    notification_id: row.get::<_, i64>(1)? as u64,
+                    message: row.get::<_, String>(2)?,
+                    error: row.get::<_, String>(3)?,
+                    attempts: row.get::<_, i64>(4)? as u32,
+                    created_at_unix: row.get::<_, i64>(5)? as u64,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     pub fn list_services(&self) -> Result<Vec<ServiceResource>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, user_id, name, type, target, duration, display_index, notify,
@@ -1541,7 +1769,7 @@ impl Store {
         let server = self.get_public_server(server_id)?;
         let services = self.list_services()?;
         let mut stmt = self.conn.prepare(
-            "SELECT service_id, created_at_unix, avg_delay
+            "SELECT service_id, created_at_unix, avg_delay, up, down
              FROM service_history
              WHERE server_id = ?1 AND created_at_unix >= ?2
              ORDER BY service_id ASC, created_at_unix ASC",
@@ -1552,6 +1780,8 @@ impl Store {
                     i64_to_u64(row.get(0)?),
                     i64_to_u64(row.get(1)?),
                     row.get::<_, f64>(2)?,
+                    i64_to_u64(row.get(3)?),
+                    i64_to_u64(row.get(4)?),
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1563,7 +1793,7 @@ impl Store {
             }
             let points = rows
                 .iter()
-                .filter(|(service_id, _, _)| *service_id == service.id)
+                .filter(|(service_id, _, _, _, _)| *service_id == service.id)
                 .collect::<Vec<_>>();
             if points.is_empty() {
                 continue;
@@ -1577,9 +1807,23 @@ impl Store {
                 display_index: service.display_index,
                 created_at: points
                     .iter()
-                    .map(|(_, created_at, _)| (*created_at as i64).saturating_mul(1000))
+                    .map(|(_, created_at, _, _, _)| (*created_at as i64).saturating_mul(1000))
                     .collect(),
-                avg_delay: points.iter().map(|(_, _, delay)| *delay).collect(),
+                avg_delay: points
+                    .iter()
+                    .map(|(_, _, delay, _, _)| *delay)
+                    .collect(),
+                packet_loss: points
+                    .iter()
+                    .map(|(_, _, _, up, down)| {
+                        let total = up.saturating_add(*down);
+                        if total == 0 {
+                            0.0
+                        } else {
+                            *down as f64 / total as f64
+                        }
+                    })
+                    .collect(),
             });
         }
         Ok(result)
@@ -1800,7 +2044,8 @@ impl Store {
     pub fn list_alert_rules(&self) -> Result<Vec<AlertRuleResource>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, user_id, name, enable, trigger_mode, notification_group_id, rules_json,
-                    fail_trigger_tasks_json, recover_trigger_tasks_json, created_at_unix, updated_at_unix
+                    fail_trigger_tasks_json, recover_trigger_tasks_json, muted_until_unix,
+                    created_at_unix, updated_at_unix
              FROM alert_rules ORDER BY id ASC",
         )?;
         let rows = stmt
@@ -1871,6 +2116,18 @@ impl Store {
         self.delete_by_ids("alert_rules", ids)
     }
 
+    pub fn set_alert_rule_mute(&self, id: u64, muted_until: u64) -> Result<AlertRuleResource> {
+        let now = unix_now() as i64;
+        let updated = self.conn.execute(
+            "UPDATE alert_rules SET muted_until_unix = ?1, updated_at_unix = ?2 WHERE id = ?3",
+            params![u64_to_i64_saturating(muted_until), now, id as i64],
+        )?;
+        if updated == 0 {
+            anyhow::bail!("alert rule not found");
+        }
+        self.get_alert_rule(id)
+    }
+
     pub fn update_host_for_user(
         &self,
         uuid: Uuid,
@@ -1928,10 +2185,33 @@ impl Store {
     }
 
     pub fn maintenance(&self) -> Result<()> {
-        let cutoff = unix_now_millis().saturating_sub(30 * 24 * 3600 * 1000);
+        const SERVER_METRICS_RETAIN_DAYS: u64 = 30;
+        const SERVICE_HISTORY_RETAIN_DAYS: u64 = 30;
+        const TRANSFERS_RETAIN_DAYS: u64 = 90;
+        const WAF_RETAIN_DAYS: u64 = 30;
+
+        let now_ms = unix_now_millis();
+        let now_s = unix_now();
+        let metrics_cutoff_ms = now_ms.saturating_sub(SERVER_METRICS_RETAIN_DAYS * 86_400_000);
+        let history_cutoff_s = now_s.saturating_sub(SERVICE_HISTORY_RETAIN_DAYS * 86_400);
+        let transfers_cutoff_s = now_s.saturating_sub(TRANSFERS_RETAIN_DAYS * 86_400);
+        let waf_cutoff_s = now_s.saturating_sub(WAF_RETAIN_DAYS * 86_400);
+
         self.conn.execute(
             "DELETE FROM server_metrics WHERE timestamp_ms < ?1",
-            params![cutoff as i64],
+            params![metrics_cutoff_ms as i64],
+        )?;
+        self.conn.execute(
+            "DELETE FROM service_history WHERE created_at_unix < ?1",
+            params![history_cutoff_s as i64],
+        )?;
+        self.conn.execute(
+            "DELETE FROM transfers WHERE created_at_unix < ?1",
+            params![transfers_cutoff_s as i64],
+        )?;
+        self.conn.execute(
+            "DELETE FROM waf WHERE block_timestamp < ?1",
+            params![waf_cutoff_s as i64],
         )?;
         self.conn.execute_batch(
             "
@@ -2054,6 +2334,22 @@ impl Store {
             params![server_id as i64],
             |row| Ok((i64_to_u64(row.get(0)?), i64_to_u64(row.get(1)?))),
         )?;
+
+        let counters_reset =
+            state.net_in_transfer < prev_in || state.net_out_transfer < prev_out;
+        if counters_reset {
+            self.conn.execute(
+                "UPDATE servers SET prev_transfer_in_snapshot = ?1, prev_transfer_out_snapshot = ?2
+                 WHERE id = ?3",
+                params![
+                    u64_to_i64_saturating(state.net_in_transfer),
+                    u64_to_i64_saturating(state.net_out_transfer),
+                    server_id as i64
+                ],
+            )?;
+            return Ok(());
+        }
+
         let in_delta = state.net_in_transfer.saturating_sub(prev_in);
         let out_delta = state.net_out_transfer.saturating_sub(prev_out);
         if in_delta == 0 && out_delta == 0 {
@@ -2093,6 +2389,11 @@ impl Store {
         self.conn.execute_batch(
             "
             PRAGMA foreign_keys = ON;
+
+            CREATE TABLE IF NOT EXISTS schema_version (
+                version INTEGER PRIMARY KEY,
+                applied_at_unix INTEGER NOT NULL
+            );
 
             CREATE TABLE IF NOT EXISTS servers (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2210,6 +2511,7 @@ impl Store {
                 request_body TEXT NOT NULL DEFAULT '',
                 verify_tls INTEGER,
                 format_metric_units INTEGER,
+                skip_check INTEGER,
                 created_at_unix INTEGER NOT NULL,
                 updated_at_unix INTEGER NOT NULL
             );
@@ -2238,6 +2540,7 @@ impl Store {
                 rules_json TEXT NOT NULL DEFAULT '[]',
                 fail_trigger_tasks_json TEXT NOT NULL DEFAULT '[]',
                 recover_trigger_tasks_json TEXT NOT NULL DEFAULT '[]',
+                muted_until_unix INTEGER NOT NULL DEFAULT 0,
                 created_at_unix INTEGER NOT NULL,
                 updated_at_unix INTEGER NOT NULL
             );
@@ -2306,42 +2609,136 @@ impl Store {
                 count INTEGER NOT NULL,
                 PRIMARY KEY (ip, block_identifier)
             );
+
+            CREATE TABLE IF NOT EXISTS pending_tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                server_id INTEGER NOT NULL,
+                task_id INTEGER NOT NULL DEFAULT 0,
+                task_type INTEGER NOT NULL,
+                data TEXT NOT NULL DEFAULT '',
+                created_at_unix INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_pending_tasks_server
+                ON pending_tasks (server_id, id);
+
+            CREATE TABLE IF NOT EXISTS notification_dead_letter (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                notification_id INTEGER NOT NULL,
+                message TEXT NOT NULL,
+                error TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                created_at_unix INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_notification_dead_letter_created
+                ON notification_dead_letter (created_at_unix);
             ",
         )?;
-        self.add_column_if_missing("servers", "user_id", "INTEGER NOT NULL DEFAULT 0")?;
-        self.add_column_if_missing(
-            "servers",
-            "prev_transfer_in_snapshot",
-            "INTEGER NOT NULL DEFAULT 0",
+        self.run_versioned_migrations()?;
+        Ok(())
+    }
+
+    fn current_schema_version(&self) -> Result<u32> {
+        let v: Option<i64> = self
+            .conn
+            .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
+                row.get(0)
+            })
+            .optional()?
+            .flatten();
+        Ok(v.unwrap_or(0).max(0) as u32)
+    }
+
+    fn record_schema_version(&self, version: u32) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO schema_version (version, applied_at_unix) VALUES (?1, ?2)",
+            params![version as i64, unix_now() as i64],
         )?;
-        self.add_column_if_missing(
-            "servers",
-            "prev_transfer_out_snapshot",
-            "INTEGER NOT NULL DEFAULT 0",
-        )?;
-        self.add_column_if_missing(
-            "services",
-            "enable_trigger_task",
-            "INTEGER NOT NULL DEFAULT 0",
-        )?;
-        self.add_column_if_missing(
-            "services",
-            "enable_show_in_service",
-            "INTEGER NOT NULL DEFAULT 0",
-        )?;
-        self.add_column_if_missing(
-            "services",
-            "fail_trigger_tasks_json",
-            "TEXT NOT NULL DEFAULT '[]'",
-        )?;
-        self.add_column_if_missing(
-            "services",
-            "recover_trigger_tasks_json",
-            "TEXT NOT NULL DEFAULT '[]'",
-        )?;
-        self.add_column_if_missing("services", "min_latency", "REAL NOT NULL DEFAULT 0")?;
-        self.add_column_if_missing("services", "max_latency", "REAL NOT NULL DEFAULT 0")?;
-        self.add_column_if_missing("services", "latency_notify", "INTEGER NOT NULL DEFAULT 0")?;
+        Ok(())
+    }
+
+    fn run_versioned_migrations(&self) -> Result<()> {
+        type MigrationFn = fn(&Store) -> Result<()>;
+        const MIGRATIONS: &[(u32, MigrationFn)] = &[
+            (1, |s| {
+                s.add_column_if_missing("servers", "user_id", "INTEGER NOT NULL DEFAULT 0")?;
+                s.add_column_if_missing(
+                    "servers",
+                    "prev_transfer_in_snapshot",
+                    "INTEGER NOT NULL DEFAULT 0",
+                )?;
+                s.add_column_if_missing(
+                    "servers",
+                    "prev_transfer_out_snapshot",
+                    "INTEGER NOT NULL DEFAULT 0",
+                )?;
+                Ok(())
+            }),
+            (2, |s| {
+                s.add_column_if_missing(
+                    "services",
+                    "enable_trigger_task",
+                    "INTEGER NOT NULL DEFAULT 0",
+                )?;
+                s.add_column_if_missing(
+                    "services",
+                    "enable_show_in_service",
+                    "INTEGER NOT NULL DEFAULT 0",
+                )?;
+                s.add_column_if_missing(
+                    "services",
+                    "fail_trigger_tasks_json",
+                    "TEXT NOT NULL DEFAULT '[]'",
+                )?;
+                s.add_column_if_missing(
+                    "services",
+                    "recover_trigger_tasks_json",
+                    "TEXT NOT NULL DEFAULT '[]'",
+                )?;
+                s.add_column_if_missing("services", "min_latency", "REAL NOT NULL DEFAULT 0")?;
+                s.add_column_if_missing("services", "max_latency", "REAL NOT NULL DEFAULT 0")?;
+                s.add_column_if_missing(
+                    "services",
+                    "latency_notify",
+                    "INTEGER NOT NULL DEFAULT 0",
+                )?;
+                Ok(())
+            }),
+            (3, |s| {
+                s.add_column_if_missing(
+                    "alert_rules",
+                    "muted_until_unix",
+                    "INTEGER NOT NULL DEFAULT 0",
+                )?;
+                Ok(())
+            }),
+            (4, |s| {
+                s.conn.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS notification_dead_letter (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        notification_id INTEGER NOT NULL,
+                        message TEXT NOT NULL,
+                        error TEXT NOT NULL,
+                        attempts INTEGER NOT NULL DEFAULT 0,
+                        created_at_unix INTEGER NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_notification_dead_letter_created
+                        ON notification_dead_letter (created_at_unix);",
+                )?;
+                Ok(())
+            }),
+            (5, |s| {
+                s.add_column_if_missing("notifications", "skip_check", "INTEGER")?;
+                Ok(())
+            }),
+        ];
+
+        let current = self.current_schema_version()?;
+        for (version, migrator) in MIGRATIONS {
+            if *version > current {
+                migrator(self)?;
+                self.record_schema_version(*version)?;
+            }
+        }
         Ok(())
     }
 
@@ -2418,7 +2815,8 @@ impl Store {
         self.conn
             .query_row(
                 "SELECT id, user_id, name, url, request_method, request_type, request_header,
-                        request_body, verify_tls, format_metric_units, created_at_unix, updated_at_unix
+                        request_body, verify_tls, format_metric_units, skip_check,
+                        created_at_unix, updated_at_unix
                  FROM notifications WHERE id = ?1",
                 params![id as i64],
                 notification_from_row,
@@ -2591,7 +2989,8 @@ impl Store {
         self.conn
             .query_row(
                 "SELECT id, user_id, name, enable, trigger_mode, notification_group_id, rules_json,
-                        fail_trigger_tasks_json, recover_trigger_tasks_json, created_at_unix, updated_at_unix
+                        fail_trigger_tasks_json, recover_trigger_tasks_json, muted_until_unix,
+                        created_at_unix, updated_at_unix
                  FROM alert_rules WHERE id = ?1",
                 params![id as i64],
                 alert_rule_from_row,
@@ -2700,8 +3099,9 @@ fn notification_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Notificati
         request_body: row.get(7)?,
         verify_tls: opt_i64_to_bool(row.get(8)?),
         format_metric_units: opt_i64_to_bool(row.get(9)?),
-        created_at: i64_to_u64(row.get(10)?),
-        updated_at: i64_to_u64(row.get(11)?),
+        skip_check: opt_i64_to_bool(row.get(10)?),
+        created_at: i64_to_u64(row.get(11)?),
+        updated_at: i64_to_u64(row.get(12)?),
     })
 }
 
@@ -2787,8 +3187,9 @@ fn alert_rule_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AlertRuleRes
         fail_trigger_tasks: serde_json::from_str(&fail_trigger_tasks_json).unwrap_or_default(),
         recover_trigger_tasks: serde_json::from_str(&recover_trigger_tasks_json)
             .unwrap_or_default(),
-        created_at: i64_to_u64(row.get(9)?),
-        updated_at: i64_to_u64(row.get(10)?),
+        muted_until: i64_to_u64(row.get(9)?),
+        created_at: i64_to_u64(row.get(10)?),
+        updated_at: i64_to_u64(row.get(11)?),
     })
 }
 
@@ -3489,6 +3890,108 @@ mod tests {
     }
 
     #[test]
+    fn maintenance_prunes_expired_history_transfers_and_waf() {
+        let store = Store::open(":memory:").unwrap();
+        let uuid = Uuid::new_v4();
+        let server = store.ensure_server_for_user(uuid, 0).unwrap();
+        let now = unix_now();
+        let stale_history = now.saturating_sub(31 * 86_400);
+        let fresh_history = now.saturating_sub(3_600);
+        let stale_transfer = now.saturating_sub(91 * 86_400);
+        let fresh_transfer = now.saturating_sub(86_400);
+        let stale_waf = now.saturating_sub(31 * 86_400);
+        let fresh_waf = now.saturating_sub(3_600);
+
+        // service_history: one stale, one fresh
+        store
+            .conn
+            .execute(
+                "INSERT INTO service_history
+                    (service_id, server_id, avg_delay, up, down, data, created_at_unix, updated_at_unix)
+                 VALUES (1, ?1, 0.0, 0, 0, '', ?2, ?2),
+                        (1, ?1, 0.0, 0, 0, '', ?3, ?3)",
+                params![server.id as i64, stale_history as i64, fresh_history as i64],
+            )
+            .unwrap();
+
+        // transfers: one stale, one fresh
+        store
+            .conn
+            .execute(
+                "INSERT INTO transfers
+                    (server_id, in_bytes, out_bytes, created_at_unix, updated_at_unix)
+                 VALUES (?1, 1, 1, ?2, ?2), (?1, 2, 2, ?3, ?3)",
+                params![server.id as i64, stale_transfer as i64, fresh_transfer as i64],
+            )
+            .unwrap();
+
+        // waf: one stale identifier, one fresh identifier
+        let ip = ip_string_to_binary("203.0.113.7").unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO waf (ip, block_identifier, block_reason, block_timestamp, count)
+                 VALUES (?1, 1, 0, ?2, 1), (?1, 2, 0, ?3, 1)",
+                params![ip, stale_waf as i64, fresh_waf as i64],
+            )
+            .unwrap();
+
+        store.maintenance().unwrap();
+
+        let history_count: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM service_history WHERE server_id = ?1",
+                params![server.id as i64],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(history_count, 1);
+
+        let transfer_count: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM transfers WHERE server_id = ?1",
+                params![server.id as i64],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(transfer_count, 1);
+
+        let waf_count: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM waf", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(waf_count, 1);
+    }
+
+    #[test]
+    fn schema_version_migrations_are_recorded_and_idempotent() {
+        let store = Store::open(":memory:").unwrap();
+        let version: i64 = store
+            .conn
+            .query_row(
+                "SELECT COALESCE(MAX(version), 0) FROM schema_version",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(version >= 3, "expected at least version 3, got {version}");
+
+        let count_before: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM schema_version", [], |row| row.get(0))
+            .unwrap();
+        // Re-running migrations must not duplicate version rows.
+        store.run_versioned_migrations().unwrap();
+        let count_after: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM schema_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count_before, count_after);
+    }
+
+    #[test]
     fn state_updates_write_queryable_server_metrics() {
         let store = Store::open(":memory:").unwrap();
         let uuid = Uuid::new_v4();
@@ -3569,6 +4072,52 @@ mod tests {
         let transfers = store.list_transfers_since(server.id, 0).unwrap();
         assert_eq!(transfers[0].in_bytes, 130);
         assert_eq!(transfers[0].out_bytes, 70);
+    }
+
+    #[test]
+    fn agent_counter_reset_starts_new_baseline_without_phantom_delta() {
+        let store = Store::open(":memory:").unwrap();
+        let uuid = Uuid::new_v4();
+        let server = store.ensure_server_for_user(uuid, 0).unwrap();
+
+        store
+            .update_state_for_user(
+                uuid,
+                0,
+                State {
+                    net_in_transfer: 1_000,
+                    net_out_transfer: 500,
+                    ..State::default()
+                },
+            )
+            .unwrap();
+        store
+            .update_state_for_user(
+                uuid,
+                0,
+                State {
+                    net_in_transfer: 10,
+                    net_out_transfer: 5,
+                    ..State::default()
+                },
+            )
+            .unwrap();
+        store
+            .update_state_for_user(
+                uuid,
+                0,
+                State {
+                    net_in_transfer: 60,
+                    net_out_transfer: 25,
+                    ..State::default()
+                },
+            )
+            .unwrap();
+
+        let transfers = store.list_transfers_since(server.id, 0).unwrap();
+        assert_eq!(transfers.len(), 1);
+        assert_eq!(transfers[0].in_bytes, 1_050);
+        assert_eq!(transfers[0].out_bytes, 520);
     }
 
     #[test]
@@ -3693,6 +4242,7 @@ mod tests {
         assert_eq!(server_services.len(), 1);
         assert_eq!(server_services[0].monitor_id, service.id);
         assert_eq!(server_services[0].avg_delay, vec![12.0]);
+        assert_eq!(server_services[0].packet_loss, vec![0.0]);
 
         let services = store.service_response_items().unwrap();
         let item = services.get(&service.id).unwrap();
@@ -3864,5 +4414,70 @@ mod tests {
 
         assert!(!store.record_cron_result(server.id, &result, false).unwrap());
         assert!(store.record_cron_result(server.id, &result, true).unwrap());
+    }
+
+    #[test]
+    fn delete_servers_cascades_to_related_tables() {
+        let store = Store::open(":memory:").unwrap();
+        let server = store.ensure_server_for_user(Uuid::new_v4(), 0).unwrap();
+        let sid = server.id as i64;
+        let now = unix_now() as i64;
+
+        store
+            .conn
+            .execute(
+                "INSERT INTO transfers (server_id, in_bytes, out_bytes, created_at_unix, updated_at_unix)
+                 VALUES (?1, 1, 2, ?2, ?2)",
+                params![sid, now],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO service_history
+                   (service_id, server_id, avg_delay, up, down, data, created_at_unix, updated_at_unix)
+                 VALUES (1, ?1, 0, 1, 0, '', ?2, ?2)",
+                params![sid, now],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO server_metrics (server_id, metric, timestamp_ms, value)
+                 VALUES (?1, 'cpu', ?2, 1.0)",
+                params![sid, now * 1000],
+            )
+            .unwrap();
+        store
+            .enqueue_pending_task(server.id, 1, TaskType::Command.as_u64(), "")
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO nat (user_id, enabled, name, server_id, host, domain, created_at_unix, updated_at_unix)
+                 VALUES (0, 1, 'n', ?1, 'h', 'd', ?2, ?2)",
+                params![sid, now],
+            )
+            .unwrap();
+
+        assert_eq!(store.delete_servers(&[server.id]).unwrap(), 1);
+
+        for table in [
+            "transfers",
+            "service_history",
+            "server_metrics",
+            "pending_tasks",
+            "nat",
+        ] {
+            let count: i64 = store
+                .conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE server_id = ?1"),
+                    params![sid],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 0, "{table} should be empty after delete_servers");
+        }
     }
 }

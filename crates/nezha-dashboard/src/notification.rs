@@ -1,4 +1,5 @@
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use reqwest::{Client, Method, Url, redirect::Policy};
@@ -11,6 +12,10 @@ const REQUEST_METHOD_POST: u8 = 2;
 const REQUEST_TYPE_JSON: u8 = 1;
 const REQUEST_TYPE_FORM: u8 = 2;
 
+const NOTIFICATION_MAX_ATTEMPTS: u32 = 3;
+const NOTIFICATION_BACKOFF_BASE_MS: u64 = 1_000;
+const TEMPLATE_MAX_PASSES: usize = 8;
+
 pub(crate) async fn send_notification_group(
     notifications: Vec<NotificationResource>,
     message: &str,
@@ -20,7 +25,7 @@ pub(crate) async fn send_notification_group(
         let id = notification.id;
         results.push((
             id,
-            send_notification(&notification, message)
+            send_notification_with_retry(&notification, message)
                 .await
                 .map_err(|err| err.to_string()),
         ));
@@ -28,24 +33,69 @@ pub(crate) async fn send_notification_group(
     results
 }
 
+pub(crate) async fn send_notification_with_retry(
+    notification: &NotificationResource,
+    message: &str,
+) -> Result<()> {
+    let mut last_err: Option<anyhow::Error> = None;
+    for attempt in 0..NOTIFICATION_MAX_ATTEMPTS {
+        match send_notification(notification, message).await {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                last_err = Some(err);
+                if attempt + 1 < NOTIFICATION_MAX_ATTEMPTS {
+                    let delay_ms = NOTIFICATION_BACKOFF_BASE_MS << attempt;
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                }
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("notification send failed")))
+}
+
+pub(crate) fn record_dead_letters(
+    store: &crate::store::Store,
+    message: &str,
+    results: &[(u64, Result<(), String>)],
+) {
+    for (id, result) in results {
+        if let Err(err) = result {
+            if let Err(e) = store.record_notification_dead_letter(
+                *id,
+                message,
+                err,
+                NOTIFICATION_MAX_ATTEMPTS,
+            ) {
+                tracing::warn!(notification_id = *id, %e, "failed to persist notification dead-letter");
+            }
+        }
+    }
+}
+
 pub(crate) async fn send_notification(
     notification: &NotificationResource,
     message: &str,
 ) -> Result<()> {
     let url = render_template_url(&notification.url, message)?;
-    ensure_allowed_notification_url(&url).await?;
+    let pinned_addrs = resolve_allowed_notification_addrs(&url).await?;
 
     let method = request_method(notification.request_method)?;
     let body = request_body(notification, message)?;
-    let client = Client::builder()
+    let mut builder = Client::builder()
         .redirect(Policy::none())
         .timeout(std::time::Duration::from_secs(30))
-        .danger_accept_invalid_certs(!notification.verify_tls.unwrap_or(true))
+        .danger_accept_invalid_certs(!notification.verify_tls.unwrap_or(true));
+    if let Some(host) = url.host_str() {
+        if !pinned_addrs.is_empty() {
+            builder = builder.resolve_to_addrs(host, &pinned_addrs);
+        }
+    }
+    let client = builder
         .build()
         .context("failed to build notification http client")?;
 
     let mut request = client.request(method, url);
-    request = apply_headers(request, &notification.request_header)?;
+    request = apply_headers(request, &notification.request_header, message)?;
     if let Some(body) = body {
         request = request.body(body);
         request = if notification.request_type == REQUEST_TYPE_FORM {
@@ -105,12 +155,14 @@ fn request_body(notification: &NotificationResource, message: &str) -> Result<Op
 fn apply_headers(
     mut request: reqwest::RequestBuilder,
     raw_headers: &str,
+    message: &str,
 ) -> Result<reqwest::RequestBuilder> {
     if raw_headers.trim().is_empty() {
         return Ok(request);
     }
     for (key, value) in json_string_map(raw_headers)? {
-        request = request.header(key, value);
+        let rendered_value = render_template_plain(&value, message);
+        request = request.header(key, rendered_value);
     }
     Ok(request)
 }
@@ -129,8 +181,29 @@ fn render_template_json_string(raw: &str, message: &str) -> String {
 }
 
 fn render_template(raw: &str, message: &str, message_mod: impl Fn(&str) -> String) -> String {
-    raw.replace("#NEZHA#", &message_mod(message))
-        .replace("#DATETIME#", &message_mod(&chrono::Utc::now().to_rfc3339()))
+    let now = chrono::Utc::now().to_rfc3339();
+    let context = [
+        ("#NEZHA#", message_mod(message)),
+        ("#DATETIME#", message_mod(&now)),
+    ];
+    expand_placeholders(raw, &context)
+}
+
+fn expand_placeholders(raw: &str, context: &[(&str, String)]) -> String {
+    let mut current = raw.to_owned();
+    for _ in 0..TEMPLATE_MAX_PASSES {
+        let mut next = current.clone();
+        for (placeholder, value) in context {
+            if next.contains(placeholder) {
+                next = next.replace(placeholder, value);
+            }
+        }
+        if next == current {
+            return next;
+        }
+        current = next;
+    }
+    current
 }
 
 fn json_string_map(raw: &str) -> Result<Vec<(String, String)>> {
@@ -152,7 +225,7 @@ fn json_string_map(raw: &str) -> Result<Vec<(String, String)>> {
         .collect())
 }
 
-pub(crate) async fn ensure_allowed_notification_url(url: &Url) -> Result<()> {
+pub(crate) async fn resolve_allowed_notification_addrs(url: &Url) -> Result<Vec<SocketAddr>> {
     if !matches!(url.scheme(), "http" | "https") {
         bail!("HTTP URL target is not allowed");
     }
@@ -161,7 +234,7 @@ pub(crate) async fn ensure_allowed_notification_url(url: &Url) -> Result<()> {
     };
     if let Ok(ip) = host.parse::<IpAddr>() {
         ensure_allowed_notification_ip(ip)?;
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     let port = url.port_or_known_default().unwrap_or(80);
@@ -172,10 +245,10 @@ pub(crate) async fn ensure_allowed_notification_url(url: &Url) -> Result<()> {
     if addresses.is_empty() {
         bail!("HTTP URL target is not allowed");
     }
-    for address in addresses {
+    for address in &addresses {
         ensure_allowed_notification_ip(address.ip())?;
     }
-    Ok(())
+    Ok(addresses)
 }
 
 pub(crate) fn ensure_allowed_notification_ip(ip: IpAddr) -> Result<()> {
@@ -319,6 +392,7 @@ mod tests {
             request_body: r##"{"text":"#NEZHA#"}"##.into(),
             verify_tls: Some(true),
             format_metric_units: Some(false),
+            skip_check: None,
             created_at: 0,
             updated_at: 0,
         };
@@ -327,5 +401,39 @@ mod tests {
             request_body(&notification, "hello world").unwrap(),
             Some("text=hello%20world".to_string())
         );
+    }
+
+    #[test]
+    fn nested_placeholder_expansion_resolves_recursively() {
+        let context = [
+            ("#NEZHA#", "msg=#DATETIME#".to_string()),
+            ("#DATETIME#", "2026-05-25T00:00:00Z".to_string()),
+        ];
+        assert_eq!(
+            expand_placeholders("hello #NEZHA#", &context),
+            "hello msg=2026-05-25T00:00:00Z"
+        );
+    }
+
+    #[test]
+    fn placeholder_expansion_terminates_on_self_reference() {
+        let context = [("#NEZHA#", "#NEZHA#".to_string())];
+        // Must not loop forever; result still contains placeholder after max passes.
+        let result = expand_placeholders("v=#NEZHA#", &context);
+        assert!(result.contains("#NEZHA#"));
+    }
+
+    #[test]
+    fn header_values_are_template_rendered() {
+        let raw_headers = r##"{"X-Trace":"req=#NEZHA#"}"##;
+        // apply_headers consumes a RequestBuilder; verify rendering by using the same
+        // template path the real call site walks.
+        let value = render_template_plain("req=#NEZHA#", "abc");
+        assert_eq!(value, "req=abc");
+        // and that json_string_map yields the same key our code would feed in
+        let map = json_string_map(raw_headers).unwrap();
+        assert_eq!(map.len(), 1);
+        assert_eq!(map[0].0, "X-Trace");
+        assert_eq!(map[0].1, "req=#NEZHA#");
     }
 }

@@ -35,7 +35,11 @@ use tokio::{
     sync::{RwLock, mpsc, oneshot},
     time,
 };
-use tonic::{Request, Response, Status, Streaming, metadata::MetadataMap, transport::Server};
+use tonic::{
+    Request, Response, Status, Streaming,
+    metadata::MetadataMap,
+    transport::{Identity, Server, ServerTlsConfig},
+};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -105,6 +109,12 @@ struct Args {
     #[arg(long, default_value = "data/geoip.db")]
     geoip_db: PathBuf,
 
+    #[arg(long, env = "NZ_TLS_CERT")]
+    tls_cert: Option<PathBuf>,
+
+    #[arg(long, env = "NZ_TLS_KEY")]
+    tls_key: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Option<DashboardCommand>,
 }
@@ -160,6 +170,10 @@ struct DashboardConfigFile {
     #[serde(default)]
     trust_proxy_headers: Option<bool>,
     #[serde(default)]
+    tls_cert: Option<PathBuf>,
+    #[serde(default)]
+    tls_key: Option<PathBuf>,
+    #[serde(default)]
     oauth2: Option<HashMap<String, store::OAuth2Config>>,
 }
 
@@ -175,6 +189,8 @@ struct ResolvedDashboardConfig {
     agent_tls: bool,
     install_host: String,
     trust_proxy_headers: bool,
+    tls_cert: Option<PathBuf>,
+    tls_key: Option<PathBuf>,
     initial_settings: store::DashboardSettings,
 }
 
@@ -197,6 +213,7 @@ struct AuthenticatedAgent {
 #[derive(Debug, Clone, serde::Serialize)]
 pub(crate) struct OnlineUser {
     pub(crate) user_id: u64,
+    #[serde(serialize_with = "store::serialize_unix_as_rfc3339")]
     pub(crate) connected_at: u64,
     pub(crate) ip: String,
 }
@@ -260,12 +277,17 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     let file_config = read_dashboard_config_file(&args.config)?;
-    let resolved_config = resolve_dashboard_config(&args, &file_config)?;
     let store = store::Store::open(&args.data)?;
     store.ensure_admin(&args.admin_username, &args.admin_password)?;
-    match store.dashboard_settings()? {
+    let stored_settings = store.dashboard_settings()?;
+    let resolved_config =
+        resolve_dashboard_config(&args, &file_config, stored_settings.as_ref())?;
+    match stored_settings {
         None => {
-            store.save_dashboard_settings(&resolved_config.initial_settings)?;
+            let mut initial = resolved_config.initial_settings.clone();
+            initial.client_secret = resolved_config.client_secret.clone();
+            initial.jwt_secret = resolved_config.jwt_secret.clone();
+            store.save_dashboard_settings(&initial)?;
         }
         Some(mut existing) => {
             let mut dirty = false;
@@ -277,6 +299,14 @@ async fn main() -> Result<()> {
             }
             if !existing.tls && resolved_config.initial_settings.tls {
                 existing.tls = true;
+                dirty = true;
+            }
+            if existing.client_secret != resolved_config.client_secret {
+                existing.client_secret = resolved_config.client_secret.clone();
+                dirty = true;
+            }
+            if existing.jwt_secret != resolved_config.jwt_secret {
+                existing.jwt_secret = resolved_config.jwt_secret.clone();
                 dirty = true;
             }
             if dirty {
@@ -325,8 +355,19 @@ async fn main() -> Result<()> {
 
     info!(bind = %args.bind, "starting rust dashboard grpc server");
     info!(bind = %resolved_config.http_bind, "starting rust dashboard http server");
+    let grpc_tls = build_grpc_tls(
+        resolved_config.agent_tls,
+        resolved_config.tls_cert.as_deref(),
+        resolved_config.tls_key.as_deref(),
+    )?;
     let grpc = async move {
-        Server::builder()
+        let mut builder = Server::builder();
+        if let Some(tls) = grpc_tls {
+            builder = builder
+                .tls_config(tls)
+                .map_err(anyhow::Error::from)?;
+        }
+        builder
             .add_service(NezhaServiceServer::new(service))
             .serve(args.bind)
             .await
@@ -345,6 +386,31 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+fn build_grpc_tls(
+    agent_tls: bool,
+    cert_path: Option<&Path>,
+    key_path: Option<&Path>,
+) -> Result<Option<ServerTlsConfig>> {
+    if !agent_tls {
+        if cert_path.is_some() || key_path.is_some() {
+            warn!("tls cert/key configured but agent tls is disabled; ignoring tls material");
+        }
+        return Ok(None);
+    }
+    let (Some(cert_path), Some(key_path)) = (cert_path, key_path) else {
+        warn!(
+            "agent tls is enabled but tls_cert/tls_key are not configured; serving grpc in plaintext"
+        );
+        return Ok(None);
+    };
+    let cert_pem = fs::read(cert_path)
+        .with_context(|| format!("failed to read tls cert {}", cert_path.display()))?;
+    let key_pem = fs::read(key_path)
+        .with_context(|| format!("failed to read tls key {}", key_path.display()))?;
+    let identity = Identity::from_pem(cert_pem, key_pem);
+    Ok(Some(ServerTlsConfig::new().identity(identity)))
+}
+
 fn read_dashboard_config_file(path: &Path) -> Result<DashboardConfigFile> {
     if !path.exists() {
         return Ok(DashboardConfigFile::default());
@@ -361,18 +427,21 @@ fn read_dashboard_config_file(path: &Path) -> Result<DashboardConfigFile> {
 fn resolve_dashboard_config(
     args: &Args,
     file: &DashboardConfigFile,
+    stored: Option<&store::DashboardSettings>,
 ) -> Result<ResolvedDashboardConfig> {
     let client_secret = args
         .client_secret
         .clone()
         .or_else(|| env::var("NZ_AGENT_SECRET_KEY").ok())
         .or_else(|| non_empty_opt(file.agent_secret_key.clone()))
+        .or_else(|| stored.and_then(|s| non_empty_opt(Some(s.client_secret.clone()))))
         .unwrap_or_else(|| generated_secret(32));
     let jwt_secret = args
         .jwt_secret
         .clone()
         .or_else(|| env::var("NZ_JWT_SECRET_KEY").ok())
         .or_else(|| non_empty_opt(file.jwt_secret_key.clone()))
+        .or_else(|| stored.and_then(|s| non_empty_opt(Some(s.jwt_secret.clone()))))
         .unwrap_or_else(|| generated_secret(128));
     let jwt_timeout = args
         .jwt_timeout
@@ -398,6 +467,8 @@ fn resolve_dashboard_config(
     } else {
         args.http_bind
     };
+    let tls_cert = args.tls_cert.clone().or_else(|| file.tls_cert.clone());
+    let tls_key = args.tls_key.clone().or_else(|| file.tls_key.clone());
     let initial_settings = initial_dashboard_settings(file, &site_name, &install_host, agent_tls);
 
     Ok(ResolvedDashboardConfig {
@@ -411,6 +482,8 @@ fn resolve_dashboard_config(
         agent_tls,
         install_host,
         trust_proxy_headers,
+        tls_cert,
+        tls_key,
         initial_settings,
     })
 }
@@ -737,11 +810,13 @@ impl DashboardState {
                 }
             };
             if let Some((notifications, message)) = notification {
-                for (id, result) in
-                    notification::send_notification_group(notifications, &message).await
-                {
+                let results = notification::send_notification_group(notifications, &message).await;
+                if let Ok(store) = self.store.lock() {
+                    notification::record_dead_letters(&store, &message, &results);
+                }
+                for (id, result) in &results {
                     if let Err(err) = result {
-                        warn!(notification_id = id, %err, "failed to send cron notification");
+                        warn!(notification_id = *id, %err, "failed to send cron notification");
                     }
                 }
             }
@@ -881,15 +956,18 @@ impl DashboardState {
         };
 
         for notification in effects.notifications {
-            for (id, result) in notification::send_notification_group(
+            let results = notification::send_notification_group(
                 notification.notifications,
                 &notification.message,
             )
-            .await
-            {
+            .await;
+            if let Ok(store) = self.store.lock() {
+                notification::record_dead_letters(&store, &notification.message, &results);
+            }
+            for (id, result) in &results {
                 if let Err(err) = result {
                     warn!(
-                        notification_id = id,
+                        notification_id = *id,
                         %err,
                         context = notification.log_context,
                         "failed to send service notification"
@@ -1006,15 +1084,26 @@ impl DashboardState {
 
     async fn send_task(&self, server_id: u64, task: Task) -> bool {
         let sender = self.task_senders.read().await.get(&server_id).cloned();
-        let Some(sender) = sender else {
-            return false;
-        };
-        if sender.send(task).await.is_ok() {
-            true
-        } else {
-            self.task_senders.write().await.remove(&server_id);
-            false
+        if let Some(sender) = sender {
+            match sender.send(task.clone()).await {
+                Ok(()) => return true,
+                Err(_) => {
+                    self.task_senders.write().await.remove(&server_id);
+                }
+            }
         }
+        if let Err(err) = self.persist_pending_task(server_id, &task) {
+            error!(%err, server_id, "failed to persist pending task");
+        }
+        false
+    }
+
+    fn persist_pending_task(&self, server_id: u64, task: &Task) -> anyhow::Result<()> {
+        let store = self
+            .store
+            .lock()
+            .map_err(|_| anyhow::anyhow!("store lock poisoned"))?;
+        store.enqueue_pending_task(server_id, task.id, task.r#type, &task.data)
     }
 }
 
@@ -1188,6 +1277,17 @@ impl NezhaService for DashboardService {
         let tx_guard = tx.clone();
         self.state.task_senders.write().await.insert(server.id, tx);
 
+        let pending = match self.state.store.lock() {
+            Ok(store) => store.drain_pending_tasks(server.id).unwrap_or_else(|err| {
+                error!(%err, server_id = server.id, "failed to drain pending tasks");
+                Vec::new()
+            }),
+            Err(_) => {
+                error!(server_id = server.id, "store lock poisoned while draining pending tasks");
+                Vec::new()
+            }
+        };
+
         tokio::spawn(async move {
             loop {
                 match inbound.message().await {
@@ -1212,6 +1312,19 @@ impl NezhaService for DashboardService {
         });
 
         let outbound = try_stream! {
+            for entry in pending {
+                yield Task {
+                    id: entry.task_id,
+                    r#type: entry.task_type,
+                    data: entry.data,
+                };
+                let row_id = entry.row_id;
+                if let Ok(store) = state.store.lock() {
+                    if let Err(err) = store.delete_pending_task(row_id) {
+                        error!(%err, server_id = server.id, "failed to delete pending task");
+                    }
+                }
+            }
             let mut interval = time::interval(std::time::Duration::from_secs(30));
             loop {
                 tokio::select! {
@@ -1381,10 +1494,13 @@ impl NezhaService for DashboardService {
             server.last_active_unix = stored.last_active_unix;
         }
         if let Some((notifications, message)) = ip_change_notification {
-            for (id, result) in notification::send_notification_group(notifications, &message).await
-            {
+            let results = notification::send_notification_group(notifications, &message).await;
+            if let Ok(store) = self.state.store.lock() {
+                notification::record_dead_letters(&store, &message, &results);
+            }
+            for (id, result) in &results {
                 if let Err(err) = result {
-                    warn!(notification_id = id, %err, "failed to send ip change notification");
+                    warn!(notification_id = *id, %err, "failed to send ip change notification");
                 }
             }
         }
@@ -1599,6 +1715,8 @@ mod tests {
             trust_proxy_headers: false,
             static_dir: PathBuf::from("static"),
             geoip_db: PathBuf::from("data/geoip.db"),
+            tls_cert: None,
+            tls_key: None,
             command: None,
         }
     }
@@ -1630,7 +1748,7 @@ oauth2:
 "#,
         )
         .unwrap();
-        let resolved = resolve_dashboard_config(&test_args(), &file).unwrap();
+        let resolved = resolve_dashboard_config(&test_args(), &file, None).unwrap();
 
         assert_eq!(resolved.client_secret, "agent-secret");
         assert_eq!(resolved.jwt_secret, "jwt-secret");

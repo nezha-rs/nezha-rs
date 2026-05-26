@@ -37,8 +37,10 @@ struct OperationDoc {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
     let upstream_dashboard = manifest_dir.join("../../upstream/nezha/cmd/dashboard");
-    let frontend_templates_yaml =
+    let upstream_frontend_templates_yaml =
         manifest_dir.join("../../upstream/nezha/service/singleton/frontend-templates.yaml");
+    let vendored_frontend_templates_yaml =
+        manifest_dir.join("assets/frontend-templates.yaml");
     let static_dir = manifest_dir.join("../../static");
     let controller_dir = upstream_dashboard.join("controller");
     let main_go = upstream_dashboard.join("main.go");
@@ -48,18 +50,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed={}", controller_dir.display());
     println!(
         "cargo:rerun-if-changed={}",
-        frontend_templates_yaml.display()
+        upstream_frontend_templates_yaml.display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        vendored_frontend_templates_yaml.display()
     );
     println!("cargo:rerun-if-changed={}", static_dir.display());
 
+    let frontend_templates_yaml = if upstream_frontend_templates_yaml.exists() {
+        upstream_frontend_templates_yaml
+    } else {
+        vendored_frontend_templates_yaml
+    };
     ensure_frontend_static_dirs(&static_dir, &frontend_templates_yaml)?;
 
-    let meta = parse_main_annotations(&fs::read_to_string(&main_go)?);
     let mut paths = BTreeMap::<String, Map<String, Value>>::new();
-    for file in go_files(&controller_dir)? {
-        println!("cargo:rerun-if-changed={}", file.display());
-        parse_controller_annotations(&fs::read_to_string(&file)?, &meta.base_path, &mut paths);
-    }
+    let meta = if main_go.exists() && controller_dir.exists() {
+        let meta = parse_main_annotations(&fs::read_to_string(&main_go)?);
+        let security_scheme = meta.security_schemes.first().map(String::as_str);
+        for file in go_files(&controller_dir)? {
+            println!("cargo:rerun-if-changed={}", file.display());
+            parse_controller_annotations(
+                &fs::read_to_string(&file)?,
+                &meta.base_path,
+                &mut paths,
+                security_scheme,
+            );
+        }
+        meta
+    } else {
+        println!(
+            "cargo:warning=upstream Go sources not found at {}; emitting minimal swagger doc",
+            upstream_dashboard.display()
+        );
+        SwaggerMeta::default()
+    };
 
     let security_schemes = if meta.security_schemes.is_empty() {
         Map::new()
@@ -169,6 +195,7 @@ fn parse_controller_annotations(
     source: &str,
     base_path: &str,
     paths: &mut BTreeMap<String, Map<String, Value>>,
+    security_scheme: Option<&str>,
 ) {
     let mut current = OperationDoc::default();
     for line in source.lines() {
@@ -191,7 +218,7 @@ fn parse_controller_annotations(
                 "Success" | "Failure" => parse_response(key, value, &mut current),
                 "Router" => {
                     if let Some((path, method)) = parse_router(value, base_path) {
-                        let operation = build_operation(&current);
+                        let operation = build_operation(&current, security_scheme);
                         paths.entry(path).or_default().insert(method, operation);
                     }
                     current = OperationDoc::default();
@@ -271,7 +298,7 @@ fn parse_router(value: &str, base_path: &str) -> Option<(String, String)> {
     Some((path, method))
 }
 
-fn build_operation(operation: &OperationDoc) -> Value {
+fn build_operation(operation: &OperationDoc, security_scheme: Option<&str>) -> Value {
     let mut value = json!({
         "summary": operation.summary,
         "description": if operation.description.is_empty() {
@@ -298,7 +325,8 @@ fn build_operation(operation: &OperationDoc) -> Value {
         .iter()
         .any(|tag| tag.contains("auth required") || tag.contains("admin required"))
     {
-        value["security"] = json!([{ "BearerAuth": [] }]);
+        let scheme = security_scheme.unwrap_or("BearerAuth");
+        value["security"] = json!([{ scheme: [] }]);
     }
     value
 }

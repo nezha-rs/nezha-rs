@@ -19,8 +19,11 @@ pub struct HostState {
     pub net_in_speed: u64,
     pub net_out_speed: u64,
     pub uptime: u64,
+    #[serde(rename = "load_1")]
     pub load1: f64,
+    #[serde(rename = "load_5")]
     pub load5: f64,
+    #[serde(rename = "load_15")]
     pub load15: f64,
     pub tcp_conn_count: u64,
     pub udp_conn_count: u64,

@@ -1,6 +1,7 @@
 /target/
 /upstream/
 /data/
+/dist/
 /.env
 /.env.*
 /config.yml
@@ -8,3 +9,6 @@
 *.db
 *.log
 .DS_Store
+Thumbs.db
+_audit_scratch.cjs
+build.log

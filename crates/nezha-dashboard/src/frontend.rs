@@ -11,10 +11,8 @@ use include_dir::{Dir, include_dir};
 use serde::{Deserialize, Serialize};
 use zip::ZipArchive;
 
-const FRONTEND_TEMPLATES_YAML: &str = include_str!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../upstream/nezha/service/singleton/frontend-templates.yaml"
-));
+const FRONTEND_TEMPLATES_YAML: &str =
+    include_str!("../assets/frontend-templates.yaml");
 
 static FRONTEND_TEMPLATES: OnceLock<Vec<FrontendTemplate>> = OnceLock::new();
 static EMBEDDED_FRONTENDS: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../../static");
@@ -98,14 +96,16 @@ fn release_zip_url(template: &FrontendTemplate) -> String {
 }
 
 fn extract_dist_zip(bytes: &[u8], target_dir: &Path) -> Result<()> {
-    if target_dir.exists() {
-        fs::remove_dir_all(target_dir)
-            .with_context(|| format!("failed to remove {}", target_dir.display()))?;
+    if let Some(parent) = target_dir.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
     }
-    fs::create_dir_all(target_dir)
-        .with_context(|| format!("failed to create {}", target_dir.display()))?;
 
     let temp_dir = temp_extract_dir(target_dir)?;
+    if temp_dir.exists() {
+        fs::remove_dir_all(&temp_dir)
+            .with_context(|| format!("failed to remove {}", temp_dir.display()))?;
+    }
     fs::create_dir_all(&temp_dir)
         .with_context(|| format!("failed to create {}", temp_dir.display()))?;
 
@@ -153,8 +153,22 @@ fn extract_dist_zip(bytes: &[u8], target_dir: &Path) -> Result<()> {
         return extraction;
     }
 
-    copy_dir_contents(&temp_dir, target_dir)?;
-    let _ = fs::remove_dir_all(&temp_dir);
+    if target_dir.exists() {
+        fs::remove_dir_all(target_dir)
+            .with_context(|| format!("failed to remove {}", target_dir.display()))?;
+    }
+    if let Err(rename_err) = fs::rename(&temp_dir, target_dir) {
+        fs::create_dir_all(target_dir)
+            .with_context(|| format!("failed to create {}", target_dir.display()))?;
+        if let Err(copy_err) = copy_dir_contents(&temp_dir, target_dir) {
+            let _ = fs::remove_dir_all(&temp_dir);
+            return Err(copy_err.context(format!(
+                "failed to publish frontend (rename: {rename_err}) into {}",
+                target_dir.display()
+            )));
+        }
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
     Ok(())
 }
 

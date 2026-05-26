@@ -27,6 +27,7 @@ pub(crate) struct AlertRuntime {
     prev_state: HashMap<u64, HashMap<u64, u8>>,
     next_transfer_checks: HashMap<(u64, u64, usize), u64>,
     last_transfer_status: HashMap<(u64, u64, usize), bool>,
+    last_transfer_cycle_start: HashMap<(u64, u64, usize), u64>,
     cycle_transfer_stats: HashMap<u64, CycleTransferStats>,
 }
 
@@ -196,6 +197,9 @@ pub(crate) async fn tick_alerts(
         let mut cycle_transfer_stats = HashMap::new();
 
         for alert in alerts {
+            if alert.muted_until > now {
+                continue;
+            }
             let alert_owner_is_admin = store.user_is_admin(alert.user_id)?;
             ensure_alert_cycle_transfer_stats(&alert, &mut cycle_transfer_stats, now);
             for server in &servers {
@@ -285,11 +289,18 @@ pub(crate) async fn tick_alerts(
                 .map_err(|_| anyhow::anyhow!("store lock poisoned"))?;
             store.notifications_for_group(action.notification_group_id)?
         };
-        for (id, result) in
-            notification::send_notification_group(notifications, &action.message).await
+        let results =
+            notification::send_notification_group(notifications, &action.message).await;
         {
+            let store = state
+                .store
+                .lock()
+                .map_err(|_| anyhow::anyhow!("store lock poisoned"))?;
+            notification::record_dead_letters(&store, &action.message, &results);
+        }
+        for (id, result) in &results {
             if let Err(err) = result {
-                warn!(notification_id = id, %err, "failed to send alert notification");
+                warn!(notification_id = *id, %err, "failed to send alert notification");
             }
         }
     }
@@ -508,7 +519,27 @@ fn rule_snapshot(
 
     if is_transfer_cycle_rule(rule_type) {
         let key = (alert_id, server.id, rule_index);
-        if runtime
+        let cycle_start = transfer_cycle_start(rule, now_unix).unwrap_or_default();
+        let last_start = runtime
+            .last_transfer_cycle_start
+            .get(&key)
+            .copied()
+            .unwrap_or(0);
+        if cycle_start > last_start {
+            runtime.last_transfer_cycle_start.insert(key, cycle_start);
+            runtime.next_transfer_checks.remove(&key);
+            runtime.last_transfer_status.remove(&key);
+            if let Some(rules) = runtime.samples.get_mut(&alert_id)
+                && let Some(samples) = rules.get_mut(&server.id)
+            {
+                samples.clear();
+            }
+            if let Some(rules) = runtime.prev_state.get_mut(&alert_id)
+                && let Some(prev) = rules.get_mut(&server.id)
+            {
+                *prev = 0;
+            }
+        } else if runtime
             .next_transfer_checks
             .get(&key)
             .is_some_and(|next| *next > now_unix)
@@ -583,7 +614,7 @@ fn rule_value(
         "disk" => percentage(state?.disk_used, host?.disk_total),
         "net_in_speed" => state?.net_in_speed as f64,
         "net_out_speed" => state?.net_out_speed as f64,
-        "net_all_speed" => state?.net_out_speed.saturating_add(state?.net_out_speed) as f64,
+        "net_all_speed" => state?.net_in_speed.saturating_add(state?.net_out_speed) as f64,
         "transfer_in" => state?.net_in_transfer as f64,
         "transfer_out" => state?.net_out_transfer as f64,
         "transfer_all" => state?
@@ -1172,6 +1203,7 @@ mod tests {
             recover_trigger_tasks: Vec::new(),
             created_at: 0,
             updated_at: 0,
+            muted_until: 0,
         };
         let now = public.last_active.saturating_add(7);
         let mut runtime = AlertRuntime::default();

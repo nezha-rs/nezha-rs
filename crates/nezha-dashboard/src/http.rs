@@ -408,6 +408,8 @@ pub fn router(state: HttpState) -> Router {
             get(list_alert_rules).post(create_alert_rule),
         )
         .route("/api/v1/alert-rule/{id}", patch(update_alert_rule))
+        .route("/api/v1/alert-rule/{id}/mute", post(mute_alert_rule))
+        .route("/api/v1/alert-rule/{id}/unmute", post(unmute_alert_rule))
         .route(
             "/api/v1/batch-delete/alert-rule",
             post(batch_delete_alert_rule),
@@ -1316,7 +1318,11 @@ async fn server_stream(
         Ok(claims) => claims,
         Err(err) => return api_error(StatusCode::OK, err.to_string()),
     };
-    let ip = request_ip(&headers).unwrap_or_default();
+    let ip = resolve_request_ip(&state, &headers)
+        .ok()
+        .flatten()
+        .or_else(|| request_ip(&headers))
+        .unwrap_or_default();
     let conn_id = uuid::Uuid::new_v4().to_string();
     ws.on_upgrade(move |socket| stream_server_updates(state, claims, ip, conn_id, socket))
 }
@@ -2608,6 +2614,64 @@ async fn batch_delete_alert_rule(
     }
 }
 
+async fn mute_alert_rule(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Path(id): Path<u64>,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    set_alert_rule_mute(state, headers, id, mute_until_from_body(&body)).await
+}
+
+async fn unmute_alert_rule(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    set_alert_rule_mute(state, headers, id, 0).await
+}
+
+fn mute_until_from_body(body: &Value) -> u64 {
+    if let Some(until) = body.get("muted_until").and_then(Value::as_u64) {
+        return until;
+    }
+    if let Some(seconds) = body.get("duration_seconds").and_then(Value::as_u64) {
+        return unix_now().saturating_add(seconds);
+    }
+    if let Some(minutes) = body.get("duration_minutes").and_then(Value::as_u64) {
+        return unix_now().saturating_add(minutes.saturating_mul(60));
+    }
+    unix_now().saturating_add(3600)
+}
+
+async fn set_alert_rule_mute(
+    state: HttpState,
+    headers: HeaderMap,
+    id: u64,
+    muted_until: u64,
+) -> axum::response::Response {
+    let claims = match require_auth(&state, &headers) {
+        Ok(claims) => claims,
+        Err(err) => return api_error(StatusCode::OK, err.to_string()),
+    };
+    match state.dashboard.store.lock() {
+        Ok(store) => {
+            let items = match store.list_alert_rules() {
+                Ok(items) => items,
+                Err(err) => return api_error(StatusCode::OK, err.to_string()),
+            };
+            if !id_is_owned(&items, id, &claims, |item| item.id, |item| item.user_id) {
+                return api_error(StatusCode::OK, "permission denied");
+            }
+            match store.set_alert_rule_mute(id, muted_until) {
+                Ok(item) => (StatusCode::OK, Json(CommonResponse::ok(item))).into_response(),
+                Err(err) => api_error(StatusCode::OK, err.to_string()),
+            }
+        }
+        Err(_) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "store lock poisoned"),
+    }
+}
+
 async fn list_crons(State(state): State<HttpState>, headers: HeaderMap) -> impl IntoResponse {
     let claims = match require_auth(&state, &headers) {
         Ok(claims) => claims,
@@ -3072,7 +3136,7 @@ async fn run_maintenance(State(state): State<HttpState>, headers: HeaderMap) -> 
 }
 
 fn record_login_failure(state: &HttpState, headers: &HeaderMap) {
-    let Some(ip) = request_ip(headers) else {
+    let Some(ip) = login_ban_ip(state, headers) else {
         return;
     };
     if let Ok(store) = state.dashboard.store.lock() {
@@ -3081,13 +3145,20 @@ fn record_login_failure(state: &HttpState, headers: &HeaderMap) {
 }
 
 fn record_login_success(state: &HttpState, headers: &HeaderMap, user_id: u64) {
-    let Some(ip) = request_ip(headers) else {
+    let Some(ip) = login_ban_ip(state, headers) else {
         return;
     };
     if let Ok(store) = state.dashboard.store.lock() {
         let _ = store.delete_waf_ip_identifier(&ip, -125);
         let _ = store.delete_waf_ip_identifier(&ip, user_id as i64);
     }
+}
+
+fn login_ban_ip(state: &HttpState, headers: &HeaderMap) -> Option<String> {
+    resolve_request_ip(state, headers)
+        .ok()
+        .flatten()
+        .or_else(|| request_ip(headers))
 }
 
 fn resolve_request_ip(state: &HttpState, headers: &HeaderMap) -> Result<Option<String>> {
@@ -3974,7 +4045,7 @@ fn percent_encode(raw: &str) -> String {
 }
 
 fn record_oauth2_failure(state: &HttpState, headers: &HeaderMap) {
-    if let Some(ip) = request_ip(headers)
+    if let Some(ip) = login_ban_ip(state, headers)
         && let Ok(store) = state.dashboard.store.lock()
     {
         let _ = store.record_waf_block(&ip, 2, -1);
@@ -4416,6 +4487,8 @@ mod tests {
             admin_template: "admin-dist".to_string(),
             enable_ip_change_notification: true,
             enable_plain_ip_in_notification: false,
+            client_secret: String::new(),
+            jwt_secret: String::new(),
             oauth2: HashMap::new(),
         };
         settings.oauth2.insert(

@@ -946,13 +946,12 @@ async fn run_terminal_stream(cfg: AgentConfig, data: &str) -> Result<()> {
             continue;
         }
         match data.data[0] {
-            0 => {
-                writer.write_all(&data.data[1..])?;
-                writer.flush()?;
-            }
-            1 => {
+            1 if data.data.len() > 1 => {
                 if let Some(size) = parse_terminal_resize(&data.data[1..]) {
                     pair.master.resize(size)?;
+                } else {
+                    writer.write_all(&data.data)?;
+                    writer.flush()?;
                 }
             }
             _ => {
@@ -1136,6 +1135,14 @@ async fn fm_list_dir(tx: &mpsc::Sender<IoStreamData>, raw_path: &[u8]) {
 }
 
 async fn fm_download(tx: &mpsc::Sender<IoStreamData>, path: &str) {
+    if path.is_empty() {
+        send_fm_error(tx, "download path is empty").await;
+        return;
+    }
+    if !is_safe_fm_path(path) {
+        send_fm_error(tx, "download path is not allowed").await;
+        return;
+    }
     let mut file = match tokio::fs::File::open(path).await {
         Ok(file) => file,
         Err(err) => {
@@ -1259,13 +1266,9 @@ async fn send_fm_error(tx: &mpsc::Sender<IoStreamData>, error: &str) {
 fn is_safe_fm_path(raw: &str) -> bool {
     use std::path::{Component, Path};
     let p = Path::new(raw);
-    if p.is_absolute() {
-        return false;
-    }
     for comp in p.components() {
-        match comp {
-            Component::Normal(_) | Component::CurDir => {}
-            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return false,
+        if matches!(comp, Component::ParentDir) {
+            return false;
         }
     }
     true
@@ -1281,7 +1284,11 @@ fn create_fm_dir_payload_header(path: &str) -> Vec<u8> {
 
 fn append_fm_file_name(payload: &mut Vec<u8>, name: &str, is_dir: bool) {
     let bytes = name.as_bytes();
-    let len = bytes.len().min(u8::MAX as usize);
+    let max = u8::MAX as usize;
+    let mut len = bytes.len().min(max);
+    while len > 0 && !name.is_char_boundary(len) {
+        len -= 1;
+    }
     payload.push(if is_dir { 1 } else { 0 });
     payload.push(len as u8);
     payload.extend_from_slice(&bytes[..len]);

@@ -195,13 +195,7 @@ async fn send_webhook(
     record_type: &str,
     ip: &str,
 ) -> Result<()> {
-    let url = format_webhook_string(
-        &body.webhook_url.replace('#', "%23"),
-        body,
-        domain,
-        record_type,
-        ip,
-    );
+    let url = format_webhook_url(&body.webhook_url, body, domain, record_type, ip);
     let method = webhook_method(body.webhook_method)?;
     let mut request = client.request(method, url);
     for (key, value) in webhook_headers(body, domain, record_type, ip)? {
@@ -234,7 +228,7 @@ async fn update_cloudflare(
     dns_servers: &str,
 ) -> Result<()> {
     let (_prefix, zone) = split_domain_soa(domain, dns_servers).await?;
-    let zone_id = client
+    let zone_raw = client
         .get(format!(
             "https://api.cloudflare.com/client/v4/zones?name={zone}"
         ))
@@ -244,12 +238,13 @@ async fn update_cloudflare(
         .context("failed to query cloudflare zone")?
         .text()
         .await
-        .context("failed to read cloudflare zone response")
-        .and_then(|raw| cloudflare_first_id(&raw).context("cloudflare zone not found"))?;
+        .context("failed to read cloudflare zone response")?;
+    cloudflare_ensure_success(&zone_raw).context("cloudflare zone query failed")?;
+    let zone_id = cloudflare_first_id(&zone_raw).context("cloudflare zone not found")?;
     let records_url = format!(
         "https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records?type={record_type}&name={domain}"
     );
-    let record_id = client
+    let records_raw = client
         .get(&records_url)
         .bearer_auth(&body.access_secret)
         .send()
@@ -257,15 +252,17 @@ async fn update_cloudflare(
         .context("failed to query cloudflare dns record")?
         .text()
         .await
-        .context("failed to read cloudflare dns record response")
-        .and_then(|raw| cloudflare_first_id(&raw).context("cloudflare dns record not found"))?;
+        .context("failed to read cloudflare dns record response")?;
+    cloudflare_ensure_success(&records_raw).context("cloudflare dns record query failed")?;
+    let record_id =
+        cloudflare_first_id(&records_raw).context("cloudflare dns record not found")?;
     let payload = serde_json::json!({
         "type": record_type,
         "name": domain,
         "content": ip,
         "ttl": 60
     });
-    let status = client
+    let response = client
         .put(format!(
             "https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records/{record_id}"
         ))
@@ -274,9 +271,14 @@ async fn update_cloudflare(
         .body(payload.to_string())
         .send()
         .await
-        .context("failed to update cloudflare dns record")?
-        .status();
-    anyhow::ensure!(status.is_success(), "cloudflare returned {status}");
+        .context("failed to update cloudflare dns record")?;
+    let status = response.status();
+    let raw = response
+        .text()
+        .await
+        .context("failed to read cloudflare update response")?;
+    anyhow::ensure!(status.is_success(), "cloudflare returned {status}: {raw}");
+    cloudflare_ensure_success(&raw).context("cloudflare update failed")?;
     Ok(())
 }
 
@@ -287,14 +289,45 @@ async fn update_he(client: &Client, body: &DdnsBody, domain: &str, ip: &str) -> 
         percent_encode(&body.access_secret),
         percent_encode(ip)
     );
-    let status = client
+    let response = client
         .get(url)
         .send()
         .await
-        .context("failed to update he dns record")?
-        .status();
-    anyhow::ensure!(status.is_success(), "he returned {status}");
+        .context("failed to update he dns record")?;
+    let status = response.status();
+    let raw = response
+        .text()
+        .await
+        .context("failed to read he response")?;
+    anyhow::ensure!(status.is_success(), "he returned {status}: {raw}");
+    he_ensure_success(&raw)?;
     Ok(())
+}
+
+fn cloudflare_ensure_success(raw: &str) -> Result<()> {
+    let value =
+        serde_json::from_str::<Value>(raw).context("failed to decode cloudflare response")?;
+    if value
+        .get("success")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+    let errors = value
+        .get("errors")
+        .map(Value::to_string)
+        .unwrap_or_else(|| "unknown error".to_string());
+    bail!("cloudflare returned error: {errors}")
+}
+
+fn he_ensure_success(raw: &str) -> Result<()> {
+    let token = raw.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
+    match token.as_str() {
+        "good" | "nochg" => Ok(()),
+        "" => bail!("he returned empty response"),
+        _ => bail!("he returned error: {}", raw.trim()),
+    }
 }
 
 async fn update_tencentcloud(
@@ -508,6 +541,24 @@ fn format_webhook_string(
         .replace("#record#", record_type)
         .replace("#access_id#", &body.access_id)
         .replace("#access_secret#", &body.access_secret)
+        .replace('\r', "")
+}
+
+fn format_webhook_url(
+    raw: &str,
+    body: &DdnsBody,
+    domain: &str,
+    record_type: &str,
+    ip: &str,
+) -> String {
+    raw.trim()
+        .replace("%23", "#")
+        .replace("#ip#", &percent_encode(ip))
+        .replace("#domain#", &percent_encode(domain))
+        .replace("#type#", &percent_encode(record_to_ip_type(record_type)))
+        .replace("#record#", &percent_encode(record_type))
+        .replace("#access_id#", &percent_encode(&body.access_id))
+        .replace("#access_secret#", &percent_encode(&body.access_secret))
         .replace('\r', "")
 }
 
@@ -805,6 +856,43 @@ mod tests {
             cloudflare_first_id(r#"{"result":[{"id":"abc"}]}"#),
             Some("abc".into())
         );
+    }
+
+    #[test]
+    fn cloudflare_ensure_success_detects_failure() {
+        assert!(
+            cloudflare_ensure_success(r#"{"success":true,"result":[{"id":"abc"}]}"#).is_ok()
+        );
+        let err = cloudflare_ensure_success(
+            r#"{"success":false,"errors":[{"code":1004,"message":"bad token"}]}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("bad token"), "{err}");
+    }
+
+    #[test]
+    fn he_ensure_success_accepts_good_and_rejects_others() {
+        assert!(he_ensure_success("good 203.0.113.1").is_ok());
+        assert!(he_ensure_success("nochg 203.0.113.1").is_ok());
+        assert!(he_ensure_success("badauth").is_err());
+        assert!(he_ensure_success("nohost").is_err());
+        assert!(he_ensure_success("").is_err());
+    }
+
+    #[test]
+    fn webhook_url_decodes_then_substitutes_then_encodes() {
+        let body = webhook_body_fixture();
+        let url = format_webhook_url(
+            "https://example.com/update?ip=%23ip%23&host=%23domain%23&kind=%23type%23",
+            &body,
+            "node example.com",
+            "A",
+            "203.0.113.1",
+        );
+        assert!(url.contains("ip=203.0.113.1"));
+        assert!(url.contains("host=node%20example.com"));
+        assert!(url.contains("kind=ipv4"));
     }
 
     #[test]
