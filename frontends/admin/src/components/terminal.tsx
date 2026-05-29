@@ -35,12 +35,61 @@ interface XtermProps {
     setClose: React.Dispatch<React.SetStateAction<boolean>>
 }
 
+function keyboardEventToTerminalData(event: KeyboardEvent): string | undefined {
+    if (event.defaultPrevented || event.isComposing) return undefined
+    if (event.ctrlKey || event.metaKey) {
+        const key = event.key.toLowerCase()
+        if (event.metaKey && (key === "v" || key === "c" || key === "x")) return undefined
+        if (event.ctrlKey && key === "v") return undefined
+        if (key.length === 1 && key >= "a" && key <= "z") {
+            return String.fromCharCode(key.charCodeAt(0) - 96)
+        }
+        if (key === "[") return "\x1b"
+        if (key === "]") return "\x1d"
+        if (key === "\\") return "\x1c"
+        if (key === "^") return "\x1e"
+        if (key === "_") return "\x1f"
+    }
+
+    switch (event.key) {
+    case "Enter":
+        return "\r"
+    case "Backspace":
+        return "\x7f"
+    case "Tab":
+        return "\t"
+    case "Escape":
+        return "\x1b"
+    case "ArrowUp":
+        return "\x1b[A"
+    case "ArrowDown":
+        return "\x1b[B"
+    case "ArrowRight":
+        return "\x1b[C"
+    case "ArrowLeft":
+        return "\x1b[D"
+    case "Home":
+        return "\x1b[H"
+    case "End":
+        return "\x1b[F"
+    case "Delete":
+        return "\x1b[3~"
+    case "PageUp":
+        return "\x1b[5~"
+    case "PageDown":
+        return "\x1b[6~"
+    default:
+        return event.key.length === 1 && !event.altKey ? event.key : undefined
+    }
+}
+
 export const XtermComponent = forwardRef<HTMLDivElement, XtermProps & JSX.IntrinsicElements["div"]>(
     ({ wsUrl, setClose, ...props }, ref) => {
         const terminalIdRef = useRef<HTMLDivElement>(null)
         const terminalRef = useRef<Terminal | null>(null)
         const wsRef = useRef<WebSocket | null>(null)
         const pendingInputRef = useRef<(string | Uint8Array)[]>([])
+        const textEncoderRef = useRef(new TextEncoder())
 
         useImperativeHandle(ref, () => {
             return {
@@ -55,13 +104,15 @@ export const XtermComponent = forwardRef<HTMLDivElement, XtermProps & JSX.Intrin
         const sendResize = useRef(false)
 
         const sendTerminalData = useCallback((data: string | Uint8Array) => {
+            const payload =
+                typeof data === "string" ? textEncoderRef.current.encode(data) : data
             const ws = wsRef.current
             if (ws?.readyState === WebSocket.OPEN) {
-                ws.send(data)
+                ws.send(payload)
                 return
             }
 
-            pendingInputRef.current.push(data)
+            pendingInputRef.current.push(payload)
         }, [])
 
         const flushPendingInput = useCallback(() => {
@@ -137,7 +188,18 @@ export const XtermComponent = forwardRef<HTMLDivElement, XtermProps & JSX.Intrin
             })
             window.addEventListener("resize", onResize)
 
-            const focusTerminal = () => terminal.focus()
+            const focusTerminal = () => {
+                container.focus({ preventScroll: true })
+                terminal.focus()
+            }
+            const keydownHandler = (event: KeyboardEvent) => {
+                const data = keyboardEventToTerminalData(event)
+                if (data === undefined) return
+
+                event.preventDefault()
+                event.stopPropagation()
+                sendTerminalData(data)
+            }
             const dataDisposable = terminal.onData((data) => {
                 sendTerminalData(data)
             })
@@ -153,10 +215,12 @@ export const XtermComponent = forwardRef<HTMLDivElement, XtermProps & JSX.Intrin
                 if (!text) return
 
                 event.preventDefault()
-                terminal.paste(text)
+                event.stopPropagation()
+                sendTerminalData(text.replace(/\r?\n/g, "\r"))
                 terminal.focus()
             }
             container.addEventListener("pointerdown", focusTerminal)
+            container.addEventListener("keydown", keydownHandler, true)
             container.addEventListener("paste", pasteHandler)
 
             ws.onmessage = async (event) => {
@@ -194,6 +258,7 @@ export const XtermComponent = forwardRef<HTMLDivElement, XtermProps & JSX.Intrin
             return () => {
                 window.removeEventListener("resize", onResize)
                 container.removeEventListener("pointerdown", focusTerminal)
+                container.removeEventListener("keydown", keydownHandler, true)
                 container.removeEventListener("paste", pasteHandler)
                 dataDisposable.dispose()
                 binaryDisposable.dispose()
@@ -209,7 +274,7 @@ export const XtermComponent = forwardRef<HTMLDivElement, XtermProps & JSX.Intrin
             }
         }, [fitAddon, flushPendingInput, onResize, sendTerminalData, setClose, wsUrl])
 
-        return <div ref={terminalIdRef} {...props} />
+        return <div ref={terminalIdRef} tabIndex={0} {...props} />
     },
 )
 
@@ -235,7 +300,7 @@ export const TerminalPage = () => {
             {terminal?.session_id ? (
                 <XtermComponent
                     ref={terminalIdRef}
-                    className="h-[calc(100dvh-9rem)] min-h-[320px] mb-5 overflow-hidden rounded-md border bg-black"
+                    className="h-[calc(100dvh-9rem)] min-h-[320px] mb-5 overflow-hidden rounded-md border bg-black focus:outline-none"
                     wsUrl={`/api/v1/ws/terminal/${terminal?.session_id}`}
                     setClose={setOpen}
                 />
