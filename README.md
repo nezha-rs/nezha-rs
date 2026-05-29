@@ -66,6 +66,10 @@ Dashboard 可以直接服务已经同步到 `static/` 的前端模板。首次�
 cargo run -p nezha-dashboard -- sync-frontends
 ```
 
+管理后台前端源码已经内置在 `frontends/admin`，`sync-frontends` 会从这个本地源码构建
+`static/admin-dist`，不会再下载官方上游 admin `dist.zip`。修改 React/TypeScript 后，
+先运行上面的同步命令，再重新构建 Dashboard 二进制。
+
 同步完成后，`static/*-dist` 会被后续 Dashboard 构建嵌入到二进制中。这样部署时即使运行目录没有外部 `static/` 目录，Dashboard 仍可返回用户前台、管理后台和相关静态资源。
 
 ## 快速启动 Dashboard

@@ -57,9 +57,9 @@ authorization rules, runtime side effects, and operational entry points.
   rules and filters those stats by viewer-visible servers.
 - Dashboard alert scheduling now maintains in-memory cycle-transfer sentinel state and serves
   `cycle_transfer_stats` from runtime state instead of reconstructing them on every HTTP request.
-- Dashboard now provides a `sync-frontends` command that downloads each upstream template release
-  `dist.zip` into `static/*-dist`, so deployed Rust builds can serve the same real frontend text,
-  images, and page assets as upstream templates instead of empty placeholder directories.
+- Dashboard now provides a `sync-frontends` command that can build local `local:` frontend sources
+  such as the self-hosted admin frontend and download release `dist.zip` files for remaining
+  external templates into `static/*-dist`.
 - Dashboard frontend fallback now matches the upstream deployment model more closely: once synced,
   the Rust binary embeds `static/*-dist` at build time and can still serve the official user/admin
   websites even when the external `static/` directory is missing at runtime.

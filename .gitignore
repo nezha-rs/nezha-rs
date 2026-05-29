@@ -3,6 +3,8 @@
 /data/
 /dist/
 /dist-release/
+/frontends/*/dist/
+/frontends/*/node_modules/
 /.env
 /.env.*
 /config.yml

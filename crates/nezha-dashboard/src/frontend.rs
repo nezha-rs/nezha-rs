@@ -2,6 +2,7 @@ use std::{
     fs,
     io::{Cursor, Write},
     path::{Component, Path, PathBuf},
+    process::Command,
     sync::OnceLock,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -12,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use zip::ZipArchive;
 
 const FRONTEND_TEMPLATES_YAML: &str = include_str!("../assets/frontend-templates.yaml");
+const LOCAL_REPOSITORY_PREFIX: &str = "local:";
 
 static FRONTEND_TEMPLATES: OnceLock<Vec<FrontendTemplate>> = OnceLock::new();
 static EMBEDDED_FRONTENDS: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../../static");
@@ -66,6 +68,24 @@ pub(crate) async fn sync_frontends(static_dir: &Path) -> Result<Vec<PathBuf>> {
 
     let mut synced = Vec::new();
     for template in templates() {
+        let target_dir = static_dir.join(&template.path);
+        if let Some(source_dir) = local_frontend_source_dir(template)? {
+            println!(
+                "Syncing {} {} from local source {}",
+                template.name,
+                template.version,
+                source_dir.display()
+            );
+            let target_dir_for_build = target_dir.clone();
+            tokio::task::spawn_blocking(move || {
+                build_local_frontend(&source_dir, &target_dir_for_build)
+            })
+            .await
+            .context("local frontend build task failed")??;
+            synced.push(target_dir);
+            continue;
+        }
+
         let release_url = release_zip_url(template);
         println!(
             "Syncing {} {} from {}",
@@ -82,7 +102,6 @@ pub(crate) async fn sync_frontends(static_dir: &Path) -> Result<Vec<PathBuf>> {
             .await
             .with_context(|| format!("failed to read payload {release_url}"))?;
         let bytes = payload.to_vec();
-        let target_dir = static_dir.join(&template.path);
         let target_dir_for_extract = target_dir.clone();
         tokio::task::spawn_blocking(move || extract_dist_zip(&bytes, &target_dir_for_extract))
             .await
@@ -90,6 +109,76 @@ pub(crate) async fn sync_frontends(static_dir: &Path) -> Result<Vec<PathBuf>> {
         synced.push(target_dir);
     }
     Ok(synced)
+}
+
+fn local_frontend_source_dir(template: &FrontendTemplate) -> Result<Option<PathBuf>> {
+    let Some(raw_path) = template.repository.strip_prefix(LOCAL_REPOSITORY_PREFIX) else {
+        return Ok(None);
+    };
+    let raw_path = raw_path.trim();
+    if raw_path.is_empty() {
+        bail!(
+            "local frontend repository path is empty for {}",
+            template.name
+        );
+    }
+    let path = Path::new(raw_path);
+    let source_dir = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        workspace_root().join(path)
+    };
+    Ok(Some(source_dir))
+}
+
+fn workspace_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
+fn build_local_frontend(source_dir: &Path, target_dir: &Path) -> Result<()> {
+    if !source_dir.join("package.json").is_file() {
+        bail!(
+            "local frontend source does not contain package.json: {}",
+            source_dir.display()
+        );
+    }
+
+    run_frontend_command(source_dir, "npm", &["ci"])?;
+    run_frontend_command(source_dir, "npm", &["run", "build"])?;
+
+    let dist_dir = source_dir.join("dist");
+    if !dist_dir.is_dir() {
+        bail!(
+            "local frontend build did not create dist directory: {}",
+            dist_dir.display()
+        );
+    }
+    publish_frontend_dir(&dist_dir, target_dir)
+}
+
+fn run_frontend_command(source_dir: &Path, program: &str, args: &[&str]) -> Result<()> {
+    let mut command = if cfg!(windows) {
+        let mut command = Command::new("cmd");
+        command.arg("/C").arg(program);
+        command
+    } else {
+        Command::new(program)
+    };
+    let status = command
+        .args(args)
+        .current_dir(source_dir)
+        .status()
+        .with_context(|| format!("failed to run {program} in {}", source_dir.display()))?;
+    if !status.success() {
+        bail!(
+            "{} {} failed with status {} in {}",
+            program,
+            args.join(" "),
+            status,
+            source_dir.display()
+        );
+    }
+    Ok(())
 }
 
 fn release_zip_url(template: &FrontendTemplate) -> String {
@@ -158,6 +247,26 @@ fn extract_dist_zip(bytes: &[u8], target_dir: &Path) -> Result<()> {
         return extraction;
     }
 
+    replace_with_prepared_frontend_dir(&temp_dir, target_dir)
+}
+
+fn publish_frontend_dir(source_dir: &Path, target_dir: &Path) -> Result<()> {
+    if let Some(parent) = target_dir.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let temp_dir = temp_extract_dir(target_dir)?;
+    if temp_dir.exists() {
+        fs::remove_dir_all(&temp_dir)
+            .with_context(|| format!("failed to remove {}", temp_dir.display()))?;
+    }
+    fs::create_dir_all(&temp_dir)
+        .with_context(|| format!("failed to create {}", temp_dir.display()))?;
+    copy_dir_contents(source_dir, &temp_dir)?;
+    replace_with_prepared_frontend_dir(&temp_dir, target_dir)
+}
+
+fn replace_with_prepared_frontend_dir(temp_dir: &Path, target_dir: &Path) -> Result<()> {
     if target_dir.exists() {
         fs::remove_dir_all(target_dir)
             .with_context(|| format!("failed to remove {}", target_dir.display()))?;
@@ -264,7 +373,8 @@ mod tests {
             template.path == "admin-dist"
                 && template.is_admin
                 && template.is_official
-                && template.version == "v2.0.7"
+                && template.repository == "local:frontends/admin"
+                && template.version == "self-dev"
         }));
         assert!(templates.iter().any(|template| {
             template.path == "user-dist"
@@ -313,6 +423,21 @@ mod tests {
             release_zip_url(&template),
             "https://github.com/example/frontend/releases/download/v1.2.3/dist.zip"
         );
+    }
+
+    #[test]
+    fn local_frontend_source_dir_resolves_from_workspace_root() {
+        let template = FrontendTemplate {
+            path: "admin-dist".to_string(),
+            name: "SelfHostedAdmin".to_string(),
+            repository: "local:frontends/admin".to_string(),
+            author: "local".to_string(),
+            version: "self-dev".to_string(),
+            is_admin: true,
+            is_official: true,
+        };
+        let source_dir = local_frontend_source_dir(&template).unwrap().unwrap();
+        assert!(source_dir.ends_with(Path::new("frontends/admin")));
     }
 
     #[test]
