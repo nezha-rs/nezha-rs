@@ -159,6 +159,22 @@ export const XtermComponent = forwardRef<HTMLDivElement, XtermProps & JSX.Intrin
             container.addEventListener("pointerdown", focusTerminal)
             container.addEventListener("paste", pasteHandler)
 
+            ws.onmessage = async (event) => {
+                const data = event.data
+                if (typeof data === "string") {
+                    terminal.write(data)
+                    return
+                }
+
+                if (data instanceof ArrayBuffer) {
+                    terminal.write(new Uint8Array(data))
+                    return
+                }
+
+                if (data instanceof Blob) {
+                    terminal.write(new Uint8Array(await data.arrayBuffer()))
+                }
+            }
             ws.onopen = () => {
                 flushPendingInput()
                 terminal.focus()
@@ -181,6 +197,7 @@ export const XtermComponent = forwardRef<HTMLDivElement, XtermProps & JSX.Intrin
                 container.removeEventListener("paste", pasteHandler)
                 dataDisposable.dispose()
                 binaryDisposable.dispose()
+                ws.onmessage = null
                 ws.onopen = null
                 ws.onclose = null
                 ws.onerror = null
