@@ -39,8 +39,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let upstream_dashboard = manifest_dir.join("../../upstream/nezha/cmd/dashboard");
     let upstream_frontend_templates_yaml =
         manifest_dir.join("../../upstream/nezha/service/singleton/frontend-templates.yaml");
-    let vendored_frontend_templates_yaml =
-        manifest_dir.join("assets/frontend-templates.yaml");
+    let vendored_frontend_templates_yaml = manifest_dir.join("assets/frontend-templates.yaml");
+    let upstream_waf_html = upstream_dashboard.join("controller/waf/waf.html");
+    let vendored_waf_html = manifest_dir.join("assets/waf.html");
     let static_dir = manifest_dir.join("../../static");
     let controller_dir = upstream_dashboard.join("controller");
     let main_go = upstream_dashboard.join("main.go");
@@ -56,6 +57,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "cargo:rerun-if-changed={}",
         vendored_frontend_templates_yaml.display()
     );
+    println!("cargo:rerun-if-changed={}", upstream_waf_html.display());
+    println!("cargo:rerun-if-changed={}", vendored_waf_html.display());
     println!("cargo:rerun-if-changed={}", static_dir.display());
 
     let frontend_templates_yaml = if upstream_frontend_templates_yaml.exists() {
@@ -64,6 +67,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         vendored_frontend_templates_yaml
     };
     ensure_frontend_static_dirs(&static_dir, &frontend_templates_yaml)?;
+
+    let waf_html = if upstream_waf_html.exists() {
+        upstream_waf_html
+    } else {
+        vendored_waf_html
+    };
+    fs::copy(&waf_html, out_dir.join("waf.html"))?;
 
     let mut paths = BTreeMap::<String, Map<String, Value>>::new();
     let meta = if main_go.exists() && controller_dir.exists() {

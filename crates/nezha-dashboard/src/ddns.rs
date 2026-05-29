@@ -1,4 +1,7 @@
-use std::{net::SocketAddr, time::Duration};
+use std::{
+    net::{IpAddr, SocketAddr},
+    time::Duration,
+};
 
 use anyhow::{Context, Result, bail};
 use hmac::{Hmac, Mac};
@@ -254,8 +257,7 @@ async fn update_cloudflare(
         .await
         .context("failed to read cloudflare dns record response")?;
     cloudflare_ensure_success(&records_raw).context("cloudflare dns record query failed")?;
-    let record_id =
-        cloudflare_first_id(&records_raw).context("cloudflare dns record not found")?;
+    let record_id = cloudflare_first_id(&records_raw).context("cloudflare dns record not found")?;
     let payload = serde_json::json!({
         "type": record_type,
         "name": domain,
@@ -322,7 +324,11 @@ fn cloudflare_ensure_success(raw: &str) -> Result<()> {
 }
 
 fn he_ensure_success(raw: &str) -> Result<()> {
-    let token = raw.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
+    let token = raw
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
     match token.as_str() {
         "good" | "nochg" => Ok(()),
         "" => bail!("he returned empty response"),
@@ -632,7 +638,7 @@ fn dns_server_list(raw: &str) -> Vec<String> {
         .split(',')
         .map(str::trim)
         .filter(|server| !server.is_empty())
-        .map(ToOwned::to_owned)
+        .map(normalize_dns_server)
         .collect::<Vec<_>>();
     if servers.is_empty() {
         DEFAULT_DNS_SERVERS
@@ -641,6 +647,17 @@ fn dns_server_list(raw: &str) -> Vec<String> {
             .collect()
     } else {
         servers
+    }
+}
+
+fn normalize_dns_server(server: &str) -> String {
+    if server.parse::<SocketAddr>().is_ok() {
+        return server.to_string();
+    }
+    match server.parse::<IpAddr>() {
+        Ok(IpAddr::V4(_)) => format!("{server}:53"),
+        Ok(IpAddr::V6(_)) => format!("[{server}]:53"),
+        Err(_) => server.to_string(),
     }
 }
 
@@ -860,9 +877,7 @@ mod tests {
 
     #[test]
     fn cloudflare_ensure_success_detects_failure() {
-        assert!(
-            cloudflare_ensure_success(r#"{"success":true,"result":[{"id":"abc"}]}"#).is_ok()
-        );
+        assert!(cloudflare_ensure_success(r#"{"success":true,"result":[{"id":"abc"}]}"#).is_ok());
         let err = cloudflare_ensure_success(
             r#"{"success":false,"errors":[{"code":1004,"message":"bad token"}]}"#,
         )
@@ -906,6 +921,13 @@ mod tests {
         assert_eq!(
             dns_server_list("1.1.1.1:53, 8.8.8.8:53"),
             vec!["1.1.1.1:53".to_string(), "8.8.8.8:53".to_string()]
+        );
+        assert_eq!(
+            dns_server_list("1.1.1.1, 2001:4860:4860::8888"),
+            vec![
+                "1.1.1.1:53".to_string(),
+                "[2001:4860:4860::8888]:53".to_string()
+            ]
         );
         assert_eq!(tencentcloud_date(1_700_000_000), "2023-11-14");
         let auth = tencentcloud_authorization(

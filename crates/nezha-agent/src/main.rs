@@ -622,7 +622,12 @@ async fn handle_task(
         TaskType::ReportHostInfoDeprecated => return None,
     }
 
-    result.delay = started.elapsed().as_secs_f32();
+    if !matches!(
+        task_type,
+        TaskType::HttpGet | TaskType::TcpPing | TaskType::IcmpPing
+    ) {
+        result.delay = started.elapsed().as_secs_f32();
+    }
     Some(result)
 }
 
@@ -886,33 +891,51 @@ async fn collect_child_pipe(reader: Option<tokio::task::JoinHandle<String>>) -> 
 }
 
 async fn run_terminal_stream(cfg: AgentConfig, data: &str) -> Result<()> {
-    if cfg.disable_command_execute {
-        bail!("command execution is disabled");
-    }
     let task: StreamTask = serde_json::from_str(data).context("failed to parse terminal task")?;
     if task.stream_id.trim().is_empty() {
         bail!("terminal stream id is empty");
     }
     let (tx, mut remote) = open_iostream(&cfg, &task.stream_id).await?;
+    if cfg.disable_command_execute {
+        send_terminal_error(&tx, "command execution is disabled").await;
+        bail!("command execution is disabled");
+    }
 
     let pty_system = native_pty_system();
-    let pair = pty_system
-        .openpty(default_pty_size())
-        .context("failed to open terminal pty")?;
-    let mut child = pair
-        .slave
-        .spawn_command(terminal_command())
-        .context("failed to spawn terminal shell")?;
+    let pair = match pty_system.openpty(default_pty_size()) {
+        Ok(pair) => pair,
+        Err(err) => {
+            let message = format!("failed to open terminal pty: {err}");
+            send_terminal_error(&tx, &message).await;
+            bail!(message);
+        }
+    };
+    let mut child = match pair.slave.spawn_command(terminal_command()) {
+        Ok(child) => child,
+        Err(err) => {
+            let message = format!("failed to spawn terminal shell: {err}");
+            send_terminal_error(&tx, &message).await;
+            bail!(message);
+        }
+    };
     drop(pair.slave);
 
-    let mut reader = pair
-        .master
-        .try_clone_reader()
-        .context("failed to clone terminal pty reader")?;
-    let mut writer = pair
-        .master
-        .take_writer()
-        .context("failed to open terminal pty writer")?;
+    let mut reader = match pair.master.try_clone_reader() {
+        Ok(reader) => reader,
+        Err(err) => {
+            let message = format!("failed to clone terminal pty reader: {err}");
+            send_terminal_error(&tx, &message).await;
+            bail!(message);
+        }
+    };
+    let mut writer = match pair.master.take_writer() {
+        Ok(writer) => writer,
+        Err(err) => {
+            let message = format!("failed to open terminal pty writer: {err}");
+            send_terminal_error(&tx, &message).await;
+            bail!(message);
+        }
+    };
 
     let (pty_tx, mut pty_rx) = mpsc::channel::<Vec<u8>>(64);
     let reader_task = tokio::task::spawn_blocking(move || {
@@ -949,17 +972,12 @@ async fn run_terminal_stream(cfg: AgentConfig, data: &str) -> Result<()> {
         if data.data.is_empty() {
             continue;
         }
-        match data.data[0] {
-            1 if data.data.len() > 1 => {
-                if let Some(size) = parse_terminal_resize(&data.data[1..]) {
-                    pair.master.resize(size)?;
-                } else {
-                    warn!("invalid terminal resize frame, dropping");
-                    continue;
-                }
+        match parse_terminal_input(&data.data) {
+            TerminalInput::Resize(size) => {
+                pair.master.resize(size)?;
             }
-            _ => {
-                writer.write_all(&data.data)?;
+            TerminalInput::Data(input) => {
+                writer.write_all(input)?;
                 writer.flush()?;
             }
         }
@@ -973,6 +991,15 @@ async fn run_terminal_stream(cfg: AgentConfig, data: &str) -> Result<()> {
     let _ = reader_task.await;
     output_task.abort();
     Ok(())
+}
+
+async fn send_terminal_error(tx: &mpsc::Sender<IoStreamData>, error: &str) {
+    let message = format!("\r\n[nezha] terminal error: {error}\r\n");
+    let _ = tx
+        .send(IoStreamData {
+            data: message.into_bytes(),
+        })
+        .await;
 }
 
 fn default_pty_size() -> PtySize {
@@ -1003,6 +1030,21 @@ fn parse_terminal_resize(raw: &[u8]) -> Option<PtySize> {
         pixel_width: 0,
         pixel_height: 0,
     })
+}
+
+enum TerminalInput<'a> {
+    Resize(PtySize),
+    Data(&'a [u8]),
+}
+
+fn parse_terminal_input(data: &[u8]) -> TerminalInput<'_> {
+    if data.first() == Some(&1)
+        && data.len() > 1
+        && let Some(size) = parse_terminal_resize(&data[1..])
+    {
+        return TerminalInput::Resize(size);
+    }
+    TerminalInput::Data(data)
 }
 
 async fn run_nat_stream(cfg: AgentConfig, data: &str) -> Result<()> {
@@ -1166,11 +1208,6 @@ async fn fm_download(tx: &mpsc::Sender<IoStreamData>, path: &str) {
             return;
         }
     };
-    if size == 0 {
-        send_fm_error(tx, "requested file is empty").await;
-        return;
-    }
-
     let mut header = Vec::with_capacity(12);
     header.extend_from_slice(FM_FILE);
     header.extend_from_slice(&size.to_be_bytes());
@@ -1577,12 +1614,46 @@ round-trip min/avg/max/stddev = 1.100/2.500/4.200/0.300 ms
         assert_eq!(&payload[24..27], b"dir");
     }
 
+    #[tokio::test]
+    async fn file_manager_download_allows_zero_byte_files() {
+        let path =
+            std::env::temp_dir().join(format!("nezha-empty-download-{}", uuid::Uuid::new_v4()));
+        tokio::fs::write(&path, []).await.unwrap();
+        let (tx, mut rx) = mpsc::channel(2);
+
+        fm_download(&tx, &path.to_string_lossy()).await;
+
+        let header = rx.recv().await.unwrap().data;
+        assert_eq!(&header[..4], FM_FILE);
+        assert_eq!(u64::from_be_bytes(header[4..12].try_into().unwrap()), 0);
+        assert!(rx.try_recv().is_err());
+        let _ = tokio::fs::remove_file(path).await;
+    }
+
     #[test]
     fn terminal_resize_payload_accepts_upstream_shape() {
         let size = parse_terminal_resize(br#"{"Cols":132,"Rows":43}"#).unwrap();
 
         assert_eq!(size.cols, 132);
         assert_eq!(size.rows, 43);
+    }
+
+    #[test]
+    fn terminal_input_keeps_ctrl_a_frames_when_resize_parse_fails() {
+        match parse_terminal_input(b"\x01a") {
+            TerminalInput::Data(data) => assert_eq!(data, b"\x01a"),
+            TerminalInput::Resize(_) => panic!("ctrl-a input must not be treated as resize"),
+        }
+
+        let mut resize = vec![1];
+        resize.extend_from_slice(br#"{"Cols":132,"Rows":43}"#);
+        match parse_terminal_input(&resize) {
+            TerminalInput::Resize(size) => {
+                assert_eq!(size.cols, 132);
+                assert_eq!(size.rows, 43);
+            }
+            TerminalInput::Data(_) => panic!("valid resize frame must remain resize"),
+        }
     }
 
     #[test]

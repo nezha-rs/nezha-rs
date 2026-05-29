@@ -289,8 +289,12 @@ pub(crate) async fn tick_alerts(
                 .map_err(|_| anyhow::anyhow!("store lock poisoned"))?;
             store.notifications_for_group(action.notification_group_id)?
         };
-        let results =
-            notification::send_notification_group(notifications, &action.message).await;
+        let results = notification::send_notification_group_with_context(
+            notifications,
+            &action.message,
+            Some(&action.context),
+        )
+        .await;
         {
             let store = state
                 .store
@@ -354,6 +358,7 @@ struct AlertAction {
     notification_group_id: u64,
     message: String,
     trigger_crons: Vec<CronResource>,
+    context: notification::NotificationContext,
 }
 
 impl AlertAction {
@@ -409,6 +414,7 @@ impl AlertAction {
             notification_group_id: alert.notification_group_id,
             message: format!("[{status}] {} {}", server.name, alert.name),
             trigger_crons,
+            context: notification::NotificationContext::for_public_server(server),
         }
     }
 }
@@ -608,7 +614,7 @@ fn rule_value(
     let host = server.host.as_ref();
     Some(match rule_type {
         "cpu" => state?.cpu,
-        "gpu_max" => state?.gpu.iter().copied().fold(0.0_f64, f64::max),
+        "gpu" | "gpu_max" => state?.gpu.iter().copied().fold(0.0_f64, f64::max),
         "memory" => percentage(state?.mem_used, host?.mem_total),
         "swap" => percentage(state?.swap_used, host?.swap_total),
         "disk" => percentage(state?.disk_used, host?.disk_total),
@@ -629,7 +635,7 @@ fn rule_value(
         "tcp_conn_count" => state?.tcp_conn_count as f64,
         "udp_conn_count" => state?.udp_conn_count as f64,
         "process_count" => state?.process_count as f64,
-        "temperature_max" => state?
+        "temperature" | "temperature_max" => state?
             .temperatures
             .iter()
             .map(|item| item.temperature)

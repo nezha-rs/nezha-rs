@@ -1,13 +1,16 @@
-use std::{collections::HashMap, fs, net::IpAddr, path::Path};
+use std::{collections::HashMap, fs, net::IpAddr, path::Path, str::FromStr};
 
 use anyhow::{Context, Result};
 use bcrypt::{DEFAULT_COST, hash, verify};
 use chrono::{DateTime, Utc};
 #[cfg(test)]
 use chrono::{Duration as ChronoDuration, Months, TimeZone};
+use cron::Schedule;
 use nezha_core::{
-    CRON_COVER_ALERT_TRIGGER, CRON_COVER_ALL, CRON_COVER_IGNORE_ALL, GeoIp as CoreGeoIp,
-    Host as CoreHost, HostState as CoreHostState, SERVICE_COVER_ALL, SERVICE_COVER_IGNORE_ALL,
+    ALERT_MODE_ALWAYS_TRIGGER, ALERT_MODE_ONETIME_TRIGGER, CRON_COVER_ALERT_TRIGGER,
+    CRON_COVER_ALL, CRON_COVER_IGNORE_ALL, CRON_TYPE_CRON_TASK, CRON_TYPE_TRIGGER_TASK,
+    GeoIp as CoreGeoIp, Host as CoreHost, HostState as CoreHostState, SERVICE_COVER_ALL,
+    SERVICE_COVER_IGNORE_ALL, TaskType,
 };
 use nezha_proto::{GeoIp, Host, State, TaskResult};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -714,13 +717,16 @@ impl Store {
 
     pub fn update_server(&self, id: u64, body: &Value) -> Result<PublicServer> {
         let now = unix_now() as i64;
+        let current = self.get_public_server(id)?;
         let name = string_field(body, "name");
         let note = string_field(body, "note");
         let public_note = string_field(body, "public_note");
         let display_index = i64_field(body, "display_index") as i32;
         let hide_for_guest = bool_i64(body, "hide_for_guest");
         let enable_ddns = bool_i64(body, "enable_ddns");
-        let ddns_profiles_json = serde_json::to_string(&u64_list_field(body, "ddns_profiles"))?;
+        let ddns_profiles = u64_list_field(body, "ddns_profiles");
+        self.ensure_ddns_profiles_owned_by(current.user_id, &ddns_profiles)?;
+        let ddns_profiles_json = serde_json::to_string(&ddns_profiles)?;
         let override_ddns_domains_json = serde_json::to_string(
             body.get("override_ddns_domains")
                 .unwrap_or(&Value::Object(Default::default())),
@@ -830,6 +836,12 @@ impl Store {
     }
 
     pub fn delete_users(&self, ids: &[u64]) -> Result<usize> {
+        for id in ids {
+            self.conn.execute(
+                "DELETE FROM oauth2_binds WHERE user_id = ?1",
+                params![*id as i64],
+            )?;
+        }
         self.delete_by_ids("users", ids)
     }
 
@@ -841,6 +853,9 @@ impl Store {
         new_password: &str,
         reject_password: bool,
     ) -> Result<()> {
+        let new_username = new_username.trim();
+        anyhow::ensure!(!new_username.is_empty(), "username is required");
+        anyhow::ensure!(!new_password.is_empty(), "password is required");
         let row = self
             .conn
             .query_row(
@@ -1182,6 +1197,7 @@ impl Store {
     }
 
     pub fn delete_notification_groups(&self, ids: &[u64]) -> Result<usize> {
+        self.ensure_notification_groups_unreferenced(ids)?;
         let deleted = self.delete_named(NamedTable::NotificationGroups, ids)?;
         for id in ids {
             self.conn.execute(
@@ -1231,6 +1247,7 @@ impl Store {
         let push_successful = bool_i64(body, "push_successful");
         let notification_group_id = u64_field(body, "notification_group_id") as i64;
         let cover = u8_field(body, "cover");
+        validate_cron_input(task_type, &scheduler, &command, cover)?;
 
         let id = if let Some(id) = id {
             self.conn.execute(
@@ -1275,6 +1292,7 @@ impl Store {
     }
 
     pub fn delete_crons(&self, ids: &[u64]) -> Result<usize> {
+        self.ensure_crons_unreferenced(ids)?;
         self.delete_by_ids("crons", ids)
     }
 
@@ -1336,6 +1354,8 @@ impl Store {
         let server_id = u64_field(body, "server_id") as i64;
         let host = string_field(body, "host");
         let domain = string_field(body, "domain");
+        validate_nat_input(server_id.max(0) as u64, &host, &domain)?;
+        self.get_public_server(server_id.max(0) as u64)?;
 
         let id = if let Some(id) = id {
             self.conn.execute(
@@ -1463,7 +1483,13 @@ impl Store {
         self.conn.execute(
             "INSERT INTO pending_tasks (server_id, task_id, task_type, data, created_at_unix)
              VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![server_id as i64, task_id as i64, task_type as i64, data, now],
+            params![
+                server_id as i64,
+                task_id as i64,
+                task_type as i64,
+                data,
+                now
+            ],
         )?;
         Ok(())
     }
@@ -1487,10 +1513,8 @@ impl Store {
     }
 
     pub fn delete_pending_task(&self, row_id: i64) -> Result<()> {
-        self.conn.execute(
-            "DELETE FROM pending_tasks WHERE id = ?1",
-            params![row_id],
-        )?;
+        self.conn
+            .execute("DELETE FROM pending_tasks WHERE id = ?1", params![row_id])?;
         Ok(())
     }
 
@@ -1576,6 +1600,7 @@ impl Store {
             .and_then(Value::as_f64)
             .unwrap_or_default();
         let latency_notify = bool_i64(body, "latency_notify");
+        validate_service_input(service_type, &target, duration as u64, cover as u8)?;
         let skip_servers_json = serde_json::to_string(
             body.get("skip_servers")
                 .unwrap_or(&Value::Object(Default::default())),
@@ -1809,10 +1834,7 @@ impl Store {
                     .iter()
                     .map(|(_, created_at, _, _, _)| (*created_at as i64).saturating_mul(1000))
                     .collect(),
-                avg_delay: points
-                    .iter()
-                    .map(|(_, _, delay, _, _)| *delay)
-                    .collect(),
+                avg_delay: points.iter().map(|(_, _, delay, _, _)| *delay).collect(),
                 packet_loss: points
                     .iter()
                     .map(|(_, _, _, up, down)| {
@@ -1831,8 +1853,13 @@ impl Store {
 
     pub fn service_response_items(&self) -> Result<HashMap<u64, ServiceResponseItem>> {
         let services = self.list_services()?;
+        let services_by_id = services
+            .iter()
+            .map(|service| (service.id, service.clone()))
+            .collect::<HashMap<_, _>>();
         let mut items = services
             .into_iter()
+            .filter(|service| service.enable_show_in_service)
             .map(|service| {
                 (
                     service.id,
@@ -1870,6 +1897,12 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
         for (service_id, server_id, delay, up, down) in rows {
+            let Some(service) = services_by_id.get(&service_id) else {
+                continue;
+            };
+            if !service.enable_show_in_service || !service_covers_server(service, server_id) {
+                continue;
+            }
             let Some(item) = items.get_mut(&service_id) else {
                 continue;
             };
@@ -2007,7 +2040,9 @@ impl Store {
         let now = unix_now() as i64;
         let name = string_field(body, "name");
         let provider = string_field(body, "provider");
-        let domains_json = serde_json::to_string(&string_list_field(body, "domains"))?;
+        let domains = string_list_field(body, "domains");
+        validate_ddns_input(&provider, &domains, body)?;
+        let domains_json = serde_json::to_string(&domains)?;
         let body_json = serde_json::to_string(body)?;
 
         let id = if let Some(id) = id {
@@ -2029,6 +2064,7 @@ impl Store {
     }
 
     pub fn delete_ddns(&self, ids: &[u64]) -> Result<usize> {
+        self.ensure_ddns_unreferenced(ids)?;
         self.delete_by_ids("ddns", ids)
     }
 
@@ -2065,7 +2101,9 @@ impl Store {
         let enable = opt_bool_i64(body, "enable");
         let trigger_mode = u8_field(body, "trigger_mode") as i64;
         let notification_group_id = u64_field(body, "notification_group_id") as i64;
-        let rules_json = serde_json::to_string(&value_array_field(body, "rules"))?;
+        let rules = value_array_field(body, "rules");
+        validate_alert_rule_input(enable, trigger_mode as u8, &rules)?;
+        let rules_json = serde_json::to_string(&rules)?;
         let fail_trigger_tasks_json =
             serde_json::to_string(&u64_list_field(body, "fail_trigger_tasks"))?;
         let recover_trigger_tasks_json =
@@ -2228,19 +2266,24 @@ impl Store {
         metric: &str,
         since_ms: u64,
     ) -> Result<Vec<ServerMetricPoint>> {
-        anyhow::ensure!(is_known_server_metric(metric), "invalid metric name");
+        let Some((metric, legacy_metric)) = server_metric_names(metric) else {
+            anyhow::bail!("invalid metric name");
+        };
         let mut stmt = self.conn.prepare(
             "SELECT timestamp_ms, value FROM server_metrics
-             WHERE server_id = ?1 AND metric = ?2 AND timestamp_ms >= ?3
+             WHERE server_id = ?1 AND (metric = ?2 OR metric = ?3) AND timestamp_ms >= ?4
              ORDER BY timestamp_ms ASC",
         )?;
         let rows = stmt
-            .query_map(params![server_id as i64, metric, since_ms as i64], |row| {
-                Ok(ServerMetricPoint {
-                    ts: row.get(0)?,
-                    value: row.get(1)?,
-                })
-            })?
+            .query_map(
+                params![server_id as i64, metric, legacy_metric, since_ms as i64],
+                |row| {
+                    Ok(ServerMetricPoint {
+                        ts: row.get(0)?,
+                        value: row.get(1)?,
+                    })
+                },
+            )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
@@ -2311,8 +2354,8 @@ impl Store {
             ("load1", state.load1),
             ("load5", state.load5),
             ("load15", state.load15),
-            ("tcp_conn", state.tcp_conn_count as f64),
-            ("udp_conn", state.udp_conn_count as f64),
+            ("tcp_conn_count", state.tcp_conn_count as f64),
+            ("udp_conn_count", state.udp_conn_count as f64),
             ("process_count", state.process_count as f64),
             ("temperature", max_temp),
             ("uptime", state.uptime as f64),
@@ -2335,8 +2378,7 @@ impl Store {
             |row| Ok((i64_to_u64(row.get(0)?), i64_to_u64(row.get(1)?))),
         )?;
 
-        let counters_reset =
-            state.net_in_transfer < prev_in || state.net_out_transfer < prev_out;
+        let counters_reset = state.net_in_transfer < prev_in || state.net_out_transfer < prev_out;
         if counters_reset {
             self.conn.execute(
                 "UPDATE servers SET prev_transfer_in_snapshot = ?1, prev_transfer_out_snapshot = ?2
@@ -2860,6 +2902,101 @@ impl Store {
         let unique = unique_u64s(ids);
         for id in unique {
             self.get_public_server(id)?;
+        }
+        Ok(())
+    }
+
+    fn ensure_ddns_profiles_owned_by(&self, user_id: u64, ids: &[u64]) -> Result<()> {
+        for id in unique_u64s(ids) {
+            let profile = self.get_ddns(id)?;
+            anyhow::ensure!(
+                profile.user_id == user_id,
+                "ddns profile does not belong to server owner"
+            );
+        }
+        Ok(())
+    }
+
+    fn ensure_ddns_unreferenced(&self, ids: &[u64]) -> Result<()> {
+        let ids = unique_u64s(ids);
+        if ids.is_empty() {
+            return Ok(());
+        }
+        for server in self.list_servers()? {
+            if server
+                .ddns_profiles
+                .iter()
+                .any(|profile_id| ids.contains(profile_id))
+            {
+                anyhow::bail!("ddns profile is still referenced by server {}", server.id);
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_crons_unreferenced(&self, ids: &[u64]) -> Result<()> {
+        let ids = unique_u64s(ids);
+        if ids.is_empty() {
+            return Ok(());
+        }
+        for service in self.list_services()? {
+            if service.fail_trigger_tasks.iter().any(|id| ids.contains(id))
+                || service
+                    .recover_trigger_tasks
+                    .iter()
+                    .any(|id| ids.contains(id))
+                || service
+                    .trigger_tasks
+                    .keys()
+                    .filter_map(|id| id.parse::<u64>().ok())
+                    .any(|id| ids.contains(&id))
+            {
+                anyhow::bail!("cron is still referenced by service {}", service.id);
+            }
+        }
+        for alert in self.list_alert_rules()? {
+            if alert.fail_trigger_tasks.iter().any(|id| ids.contains(id))
+                || alert
+                    .recover_trigger_tasks
+                    .iter()
+                    .any(|id| ids.contains(id))
+            {
+                anyhow::bail!("cron is still referenced by alert rule {}", alert.id);
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_notification_groups_unreferenced(&self, ids: &[u64]) -> Result<()> {
+        let ids = unique_u64s(ids);
+        if ids.is_empty() {
+            return Ok(());
+        }
+        for service in self.list_services()? {
+            if ids.contains(&service.notification_group_id) {
+                anyhow::bail!(
+                    "notification group is still referenced by service {}",
+                    service.id
+                );
+            }
+        }
+        for cron in self.list_crons()? {
+            if ids.contains(&cron.notification_group_id) {
+                anyhow::bail!("notification group is still referenced by cron {}", cron.id);
+            }
+        }
+        for alert in self.list_alert_rules()? {
+            if ids.contains(&alert.notification_group_id) {
+                anyhow::bail!(
+                    "notification group is still referenced by alert rule {}",
+                    alert.id
+                );
+            }
+        }
+        if let Some(settings) = self.dashboard_settings()?
+            && ids.contains(&settings.ip_change_notification_group_id)
+        {
+            anyhow::bail!("notification group is still referenced by dashboard settings");
         }
         Ok(())
     }
@@ -3468,6 +3605,175 @@ fn service_covers_server(service: &ServiceResource, server_id: u64) -> bool {
     }
 }
 
+fn validate_cron_input(task_type: u8, scheduler: &str, command: &str, cover: u8) -> Result<()> {
+    anyhow::ensure!(
+        matches!(task_type, CRON_TYPE_CRON_TASK | CRON_TYPE_TRIGGER_TASK),
+        "invalid cron task type"
+    );
+    anyhow::ensure!(!command.trim().is_empty(), "cron command is required");
+    anyhow::ensure!(
+        matches!(
+            cover,
+            CRON_COVER_IGNORE_ALL | CRON_COVER_ALL | CRON_COVER_ALERT_TRIGGER
+        ),
+        "invalid cron cover"
+    );
+    match task_type {
+        CRON_TYPE_CRON_TASK => {
+            anyhow::ensure!(
+                cover != CRON_COVER_ALERT_TRIGGER,
+                "scheduled cron cannot use alert trigger cover"
+            );
+            Schedule::from_str(scheduler).context("invalid cron scheduler")?;
+        }
+        CRON_TYPE_TRIGGER_TASK => {
+            anyhow::ensure!(
+                cover == CRON_COVER_ALERT_TRIGGER,
+                "trigger task must use alert trigger cover"
+            );
+        }
+        _ => unreachable!(),
+    }
+    Ok(())
+}
+
+fn validate_nat_input(server_id: u64, host: &str, domain: &str) -> Result<()> {
+    anyhow::ensure!(server_id > 0, "nat server is required");
+    anyhow::ensure!(!host.trim().is_empty(), "nat host is required");
+    anyhow::ensure!(!domain.trim().is_empty(), "nat domain is required");
+    Ok(())
+}
+
+fn validate_service_input(service_type: u8, target: &str, duration: u64, cover: u8) -> Result<()> {
+    anyhow::ensure!(
+        matches!(
+            TaskType::from_u64(service_type as u64),
+            Some(TaskType::HttpGet | TaskType::IcmpPing | TaskType::TcpPing)
+        ),
+        "invalid service monitor type"
+    );
+    anyhow::ensure!(!target.trim().is_empty(), "service target is required");
+    anyhow::ensure!(duration > 0, "service duration is required");
+    anyhow::ensure!(
+        matches!(cover, SERVICE_COVER_ALL | SERVICE_COVER_IGNORE_ALL),
+        "invalid service cover"
+    );
+    Ok(())
+}
+
+fn validate_alert_rule_input(enable: Option<i64>, trigger_mode: u8, rules: &[Value]) -> Result<()> {
+    anyhow::ensure!(
+        matches!(
+            trigger_mode,
+            ALERT_MODE_ALWAYS_TRIGGER | ALERT_MODE_ONETIME_TRIGGER
+        ),
+        "invalid alert trigger mode"
+    );
+    if enable.unwrap_or_default() != 0 {
+        anyhow::ensure!(!rules.is_empty(), "alert rule is required");
+    }
+    for rule in rules {
+        validate_alert_rule_item(rule)?;
+    }
+    Ok(())
+}
+
+fn validate_alert_rule_item(rule: &Value) -> Result<()> {
+    let rule_type = rule
+        .get("type")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    anyhow::ensure!(!rule_type.is_empty(), "alert rule type is required");
+    anyhow::ensure!(valid_alert_rule_type(rule_type), "invalid alert rule type");
+
+    let cover = rule
+        .get("cover")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    anyhow::ensure!(matches!(cover, 0 | 1), "invalid alert rule cover");
+
+    if rule_type != "offline" {
+        let min = rule.get("min").and_then(Value::as_f64).unwrap_or_default();
+        let max = rule.get("max").and_then(Value::as_f64).unwrap_or_default();
+        anyhow::ensure!(min > 0.0 || max > 0.0, "alert rule threshold is required");
+    }
+    if rule_type.ends_with("_cycle") {
+        anyhow::ensure!(
+            rule.get("cycle_start").is_some(),
+            "alert transfer cycle_start is required"
+        );
+        anyhow::ensure!(
+            rule.get("cycle_interval")
+                .and_then(Value::as_u64)
+                .unwrap_or_default()
+                > 0,
+            "alert transfer cycle_interval is required"
+        );
+    }
+    Ok(())
+}
+
+fn valid_alert_rule_type(rule_type: &str) -> bool {
+    matches!(
+        rule_type,
+        "offline"
+            | "cpu"
+            | "gpu"
+            | "gpu_max"
+            | "memory"
+            | "swap"
+            | "disk"
+            | "net_in_speed"
+            | "net_out_speed"
+            | "net_all_speed"
+            | "transfer_in"
+            | "transfer_out"
+            | "transfer_all"
+            | "transfer_in_cycle"
+            | "transfer_out_cycle"
+            | "transfer_all_cycle"
+            | "load1"
+            | "load5"
+            | "load15"
+            | "tcp_conn_count"
+            | "udp_conn_count"
+            | "process_count"
+            | "temperature"
+            | "temperature_max"
+    )
+}
+
+fn validate_ddns_input(provider: &str, domains: &[String], body: &Value) -> Result<()> {
+    let provider = provider.trim();
+    anyhow::ensure!(!provider.is_empty(), "ddns provider is required");
+    anyhow::ensure!(!domains.is_empty(), "ddns domain is required");
+    match provider {
+        "dummy" => {}
+        "webhook" => {
+            anyhow::ensure!(
+                !string_field(body, "webhook_url").trim().is_empty(),
+                "ddns webhook_url is required"
+            );
+        }
+        "cloudflare" | "he" => {
+            anyhow::ensure!(
+                !string_field(body, "access_secret").trim().is_empty(),
+                "ddns access_secret is required"
+            );
+        }
+        "tencentcloud" => {
+            anyhow::ensure!(
+                !string_field(body, "access_id").trim().is_empty()
+                    && !string_field(body, "access_secret").trim().is_empty(),
+                "ddns access_id/access_secret are required"
+            );
+        }
+        _ => anyhow::bail!("cannot find DDNS provider {provider}"),
+    }
+    Ok(())
+}
+
 fn pet_name(uuid: Uuid) -> String {
     let raw = uuid.simple().to_string();
     format!("server-{}", &raw[..8])
@@ -3501,27 +3807,27 @@ fn generate_secret() -> String {
     Uuid::new_v4().simple().to_string()
 }
 
-fn is_known_server_metric(metric: &str) -> bool {
-    matches!(
-        metric,
-        "cpu"
-            | "memory"
-            | "swap"
-            | "disk"
-            | "net_in_speed"
-            | "net_out_speed"
-            | "net_in_transfer"
-            | "net_out_transfer"
-            | "load1"
-            | "load5"
-            | "load15"
-            | "tcp_conn"
-            | "udp_conn"
-            | "process_count"
-            | "temperature"
-            | "uptime"
-            | "gpu"
-    )
+fn server_metric_names(metric: &str) -> Option<(&'static str, &'static str)> {
+    match metric {
+        "cpu" => Some(("cpu", "cpu")),
+        "memory" => Some(("memory", "memory")),
+        "swap" => Some(("swap", "swap")),
+        "disk" => Some(("disk", "disk")),
+        "net_in_speed" => Some(("net_in_speed", "net_in_speed")),
+        "net_out_speed" => Some(("net_out_speed", "net_out_speed")),
+        "net_in_transfer" => Some(("net_in_transfer", "net_in_transfer")),
+        "net_out_transfer" => Some(("net_out_transfer", "net_out_transfer")),
+        "load1" => Some(("load1", "load1")),
+        "load5" => Some(("load5", "load5")),
+        "load15" => Some(("load15", "load15")),
+        "tcp_conn_count" | "tcp_conn" => Some(("tcp_conn_count", "tcp_conn")),
+        "udp_conn_count" | "udp_conn" => Some(("udp_conn_count", "udp_conn")),
+        "process_count" => Some(("process_count", "process_count")),
+        "temperature" => Some(("temperature", "temperature")),
+        "uptime" => Some(("uptime", "uptime")),
+        "gpu" => Some(("gpu", "gpu")),
+        _ => None,
+    }
 }
 
 fn unix_now() -> u64 {
@@ -3709,6 +4015,27 @@ mod tests {
         store.bind_oauth2(user_id, "gitlab", "open-2").unwrap();
         store.unbind_oauth2(user_id, "github").unwrap();
         assert_eq!(store.oauth2_bind_count(user_id).unwrap(), 1);
+    }
+
+    #[test]
+    fn delete_user_removes_oauth2_binds() {
+        let store = Store::open(":memory:").unwrap();
+        let old_user = store.create_user("alice", "password", 1).unwrap();
+        store.bind_oauth2(old_user, "github", "open-1").unwrap();
+
+        store.delete_users(&[old_user]).unwrap();
+        assert!(store.user_by_oauth2("github", "open-1").unwrap().is_none());
+
+        let new_user = store.create_user("bob", "password", 1).unwrap();
+        store.bind_oauth2(new_user, "github", "open-1").unwrap();
+        assert_eq!(
+            store
+                .user_by_oauth2("github", "open-1")
+                .unwrap()
+                .unwrap()
+                .id,
+            new_user
+        );
     }
 
     #[test]
@@ -3921,7 +4248,11 @@ mod tests {
                 "INSERT INTO transfers
                     (server_id, in_bytes, out_bytes, created_at_unix, updated_at_unix)
                  VALUES (?1, 1, 1, ?2, ?2), (?1, 2, 2, ?3, ?3)",
-                params![server.id as i64, stale_transfer as i64, fresh_transfer as i64],
+                params![
+                    server.id as i64,
+                    stale_transfer as i64,
+                    fresh_transfer as i64
+                ],
             )
             .unwrap();
 
@@ -4204,6 +4535,7 @@ mod tests {
                     "type": 3,
                     "target": "example.com:443",
                     "duration": 30,
+                    "enable_show_in_service": true,
                     "cover": 1,
                     "skip_servers": {
                         (owner_server.id.to_string()): true,
@@ -4254,6 +4586,178 @@ mod tests {
         assert_eq!(item.delay.unwrap()[29], 12.0);
         assert_eq!(item.up.unwrap()[29], 1);
         assert_eq!(item.down.unwrap()[29], 0);
+    }
+
+    #[test]
+    fn server_ddns_profiles_must_belong_to_server_owner_and_block_delete() {
+        let store = Store::open(":memory:").unwrap();
+        let alice_id = store.create_user("alice", "secret1", 1).unwrap();
+        let bob_id = store.create_user("bob", "secret2", 1).unwrap();
+        let server = store
+            .ensure_server_for_user(Uuid::new_v4(), alice_id)
+            .unwrap();
+        let alice_ddns = store
+            .upsert_ddns(
+                None,
+                alice_id,
+                &serde_json::json!({
+                    "name": "alice",
+                    "provider": "dummy",
+                    "domains": ["example.com"],
+                    "max_retries": 1
+                }),
+            )
+            .unwrap();
+        let bob_ddns = store
+            .upsert_ddns(
+                None,
+                bob_id,
+                &serde_json::json!({
+                    "name": "bob",
+                    "provider": "dummy",
+                    "domains": ["example.net"],
+                    "max_retries": 1
+                }),
+            )
+            .unwrap();
+
+        assert!(
+            store
+                .update_server(
+                    server.id,
+                    &serde_json::json!({
+                        "name": "srv",
+                        "ddns_profiles": [bob_ddns.id]
+                    })
+                )
+                .is_err()
+        );
+        store
+            .update_server(
+                server.id,
+                &serde_json::json!({
+                    "name": "srv",
+                    "enable_ddns": true,
+                    "ddns_profiles": [alice_ddns.id]
+                }),
+            )
+            .unwrap();
+        assert!(store.delete_ddns(&[alice_ddns.id]).is_err());
+    }
+
+    #[test]
+    fn nat_alert_and_reference_validation_reject_invalid_noops() {
+        let store = Store::open(":memory:").unwrap();
+        let server = store.ensure_server_for_user(Uuid::new_v4(), 0).unwrap();
+
+        assert!(
+            store
+                .upsert_nat(
+                    None,
+                    0,
+                    &serde_json::json!({
+                        "server_id": server.id,
+                        "host": "",
+                        "domain": "app.example.com"
+                    })
+                )
+                .is_err()
+        );
+        store
+            .upsert_nat(
+                None,
+                0,
+                &serde_json::json!({
+                    "server_id": server.id,
+                    "host": "127.0.0.1:8080",
+                    "domain": "app.example.com"
+                }),
+            )
+            .unwrap();
+
+        assert!(
+            store
+                .upsert_alert_rule(
+                    None,
+                    0,
+                    &serde_json::json!({
+                        "name": "empty",
+                        "enable": true,
+                        "trigger_mode": 0,
+                        "rules": []
+                    })
+                )
+                .is_err()
+        );
+        store
+            .upsert_alert_rule(
+                None,
+                0,
+                &serde_json::json!({
+                    "name": "gpu",
+                    "enable": true,
+                    "trigger_mode": 0,
+                    "rules": [{
+                        "type": "gpu",
+                        "max": 95,
+                        "cover": 0
+                    }]
+                }),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn referenced_crons_and_notification_groups_cannot_be_deleted() {
+        let store = Store::open(":memory:").unwrap();
+        let notification = store
+            .upsert_notification(
+                None,
+                0,
+                &serde_json::json!({
+                    "name": "hook",
+                    "url": "https://example.com/?text=#NEZHA#",
+                    "request_method": 1,
+                    "request_type": 1,
+                    "skip_check": true
+                }),
+            )
+            .unwrap();
+        let group = store
+            .upsert_notification_group(None, 0, "group", &[notification.id])
+            .unwrap();
+        let cron = store
+            .upsert_cron(
+                None,
+                0,
+                &serde_json::json!({
+                    "name": "cron",
+                    "task_type": 0,
+                    "scheduler": "0 * * * * * *",
+                    "command": "echo ok",
+                    "notification_group_id": group.group.id,
+                    "cover": 0
+                }),
+            )
+            .unwrap();
+        store
+            .upsert_service(
+                None,
+                0,
+                &serde_json::json!({
+                    "name": "tcp",
+                    "type": 3,
+                    "target": "example.com:443",
+                    "duration": 30,
+                    "notification_group_id": group.group.id,
+                    "fail_trigger_tasks": [cron.id],
+                    "cover": 0
+                }),
+            )
+            .unwrap();
+
+        assert!(store.delete_crons(&[cron.id]).is_err());
+        assert!(store.delete_notification_groups(&[group.group.id]).is_err());
     }
 
     #[test]

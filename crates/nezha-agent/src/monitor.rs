@@ -1,3 +1,5 @@
+#[cfg(target_os = "linux")]
+use std::path::Path;
 use std::{
     collections::HashSet,
     process::{Command, Stdio},
@@ -5,8 +7,6 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-#[cfg(target_os = "linux")]
-use std::path::Path;
 
 use nezha_core::AgentConfig;
 use nezha_proto::{Host, State, StateSensorTemperature};

@@ -2011,6 +2011,8 @@ dependencies = [
  "cron",
  "futures-util",
  "hmac",
+ "hyper",
+ "hyper-util",
  "include_dir",
  "jsonwebtoken",
  "maxminddb",

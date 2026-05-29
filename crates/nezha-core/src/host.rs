@@ -1,11 +1,22 @@
-use serde::{Deserialize, Serialize};
+use serde::ser::SerializeMap;
+use serde::{Deserialize, Serialize, Serializer};
 
 use nezha_proto::{GeoIp as PbGeoIp, Host as PbHost, Ip as PbIp, State as PbState};
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 pub struct SensorTemperature {
     pub name: String,
     pub temperature: f64,
+}
+
+impl Serialize for SensorTemperature {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(3))?;
+        map.serialize_entry("name", &self.name)?;
+        map.serialize_entry("temperature", &self.temperature)?;
+        map.serialize_entry("Temperature", &self.temperature)?;
+        map.end()
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]

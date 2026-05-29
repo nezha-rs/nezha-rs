@@ -95,7 +95,7 @@ impl AgentConfig {
         fs::write(path, raw).with_context(|| format!("failed to write config {}", path.display()))
     }
 
-    pub fn validate(&mut self, remote_edit: bool) -> Result<()> {
+    pub fn validate(&mut self, _remote_edit: bool) -> Result<()> {
         if self.report_delay == 0 {
             self.report_delay = 3;
         }
@@ -107,13 +107,11 @@ impl AgentConfig {
         if !(1..=4).contains(&self.report_delay) {
             return Err(anyhow!("report_delay ranges from 1 to 4 seconds"));
         }
-        if !remote_edit {
-            if self.server.trim().is_empty() {
-                return Err(anyhow!("server address should not be empty"));
-            }
-            if self.client_secret.trim().is_empty() {
-                return Err(anyhow!("client_secret must be specified"));
-            }
+        if self.server.trim().is_empty() {
+            return Err(anyhow!("server address should not be empty"));
+        }
+        if self.client_secret.trim().is_empty() {
+            return Err(anyhow!("client_secret must be specified"));
         }
         Ok(())
     }
@@ -209,5 +207,22 @@ mod tests {
 
         assert_eq!(cfg.report_delay, 3);
         assert_eq!(cfg.ip_report_period, 30);
+    }
+
+    #[test]
+    fn remote_validate_rejects_empty_connection_fields() {
+        let mut cfg = AgentConfig {
+            server: String::new(),
+            client_secret: "secret".to_string(),
+            ..AgentConfig::default()
+        };
+        assert!(cfg.validate(true).is_err());
+
+        let mut cfg = AgentConfig {
+            server: "127.0.0.1:5555".to_string(),
+            client_secret: String::new(),
+            ..AgentConfig::default()
+        };
+        assert!(cfg.validate(true).is_err());
     }
 }

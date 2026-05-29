@@ -1,6 +1,6 @@
 use std::{collections::HashMap, sync::Arc};
 
-use tokio::sync::{Mutex, RwLock, mpsc};
+use tokio::sync::{Mutex, Notify, RwLock, mpsc};
 
 const STREAM_MAGIC: [u8; 4] = [0xff, 0x05, 0xff, 0x05];
 const STREAM_BUFFER: usize = 64;
@@ -14,6 +14,7 @@ pub(crate) struct IoStreamRegistry {
 pub(crate) struct IoStreamSession {
     creator_user_id: u64,
     target_server_id: u64,
+    agent_connected: Notify,
     to_agent_tx: mpsc::Sender<Vec<u8>>,
     to_agent_rx: Mutex<Option<mpsc::Receiver<Vec<u8>>>>,
     to_user_tx: mpsc::Sender<Vec<u8>>,
@@ -35,6 +36,7 @@ impl IoStreamRegistry {
             Arc::new(IoStreamSession {
                 creator_user_id,
                 target_server_id,
+                agent_connected: Notify::new(),
                 to_agent_tx,
                 to_agent_rx: Mutex::new(Some(to_agent_rx)),
                 to_user_tx,
@@ -71,6 +73,19 @@ impl IoStreamSession {
 
     pub(crate) async fn take_agent_receiver(&self) -> Option<mpsc::Receiver<Vec<u8>>> {
         self.to_agent_rx.lock().await.take()
+    }
+
+    pub(crate) fn mark_agent_connected(&self) {
+        self.agent_connected.notify_waiters();
+    }
+
+    pub(crate) async fn wait_agent_connected(&self, timeout: std::time::Duration) -> bool {
+        if self.to_agent_rx.lock().await.is_none() {
+            return true;
+        }
+        tokio::time::timeout(timeout, self.agent_connected.notified())
+            .await
+            .is_ok()
     }
 
     pub(crate) async fn take_user_receiver(&self) -> Option<mpsc::Receiver<Vec<u8>>> {

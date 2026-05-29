@@ -5,7 +5,7 @@ use anyhow::{Context, Result, bail};
 use reqwest::{Client, Method, Url, redirect::Policy};
 use serde_json::Value;
 
-use crate::store::NotificationResource;
+use crate::store::{NotificationResource, PublicServer};
 
 const REQUEST_METHOD_GET: u8 = 1;
 const REQUEST_METHOD_POST: u8 = 2;
@@ -16,16 +16,83 @@ const NOTIFICATION_MAX_ATTEMPTS: u32 = 3;
 const NOTIFICATION_BACKOFF_BASE_MS: u64 = 1_000;
 const TEMPLATE_MAX_PASSES: usize = 8;
 
-pub(crate) async fn send_notification_group(
+#[derive(Debug, Clone, Default)]
+pub(crate) struct NotificationContext {
+    server: Option<ServerTemplateContext>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ServerTemplateContext {
+    name: String,
+    ip: String,
+    ipv4: String,
+    ipv6: String,
+    cpu: f64,
+    mem: f64,
+    swap: f64,
+    disk: f64,
+    transfer_in: u64,
+    transfer_out: u64,
+    net_in_speed: u64,
+    net_out_speed: u64,
+    load1: f64,
+    load5: f64,
+    load15: f64,
+}
+
+impl NotificationContext {
+    pub(crate) fn for_public_server(server: &PublicServer) -> Self {
+        let geoip = server.geoip.as_ref();
+        let state = server.state.as_ref();
+        let host = server.host.as_ref();
+        Self {
+            server: Some(ServerTemplateContext {
+                name: server.name.clone(),
+                ip: geoip.map(|geoip| geoip.ip.join()).unwrap_or_default(),
+                ipv4: geoip
+                    .map(|geoip| geoip.ip.ipv4_addr.clone())
+                    .unwrap_or_default(),
+                ipv6: geoip
+                    .map(|geoip| geoip.ip.ipv6_addr.clone())
+                    .unwrap_or_default(),
+                cpu: state.map(|state| state.cpu).unwrap_or_default(),
+                mem: percentage(
+                    state.map(|state| state.mem_used).unwrap_or_default(),
+                    host.map(|host| host.mem_total).unwrap_or_default(),
+                ),
+                swap: percentage(
+                    state.map(|state| state.swap_used).unwrap_or_default(),
+                    host.map(|host| host.swap_total).unwrap_or_default(),
+                ),
+                disk: percentage(
+                    state.map(|state| state.disk_used).unwrap_or_default(),
+                    host.map(|host| host.disk_total).unwrap_or_default(),
+                ),
+                transfer_in: state.map(|state| state.net_in_transfer).unwrap_or_default(),
+                transfer_out: state
+                    .map(|state| state.net_out_transfer)
+                    .unwrap_or_default(),
+                net_in_speed: state.map(|state| state.net_in_speed).unwrap_or_default(),
+                net_out_speed: state.map(|state| state.net_out_speed).unwrap_or_default(),
+                load1: state.map(|state| state.load1).unwrap_or_default(),
+                load5: state.map(|state| state.load5).unwrap_or_default(),
+                load15: state.map(|state| state.load15).unwrap_or_default(),
+            }),
+        }
+    }
+}
+
+pub(crate) async fn send_notification_group_with_context(
     notifications: Vec<NotificationResource>,
     message: &str,
+    context: Option<&NotificationContext>,
 ) -> Vec<(u64, Result<(), String>)> {
     let mut results = Vec::with_capacity(notifications.len());
     for notification in notifications {
         let id = notification.id;
         results.push((
             id,
-            send_notification_with_retry(&notification, message)
+            send_notification_with_retry_with_context(&notification, message, context)
                 .await
                 .map_err(|err| err.to_string()),
         ));
@@ -37,9 +104,17 @@ pub(crate) async fn send_notification_with_retry(
     notification: &NotificationResource,
     message: &str,
 ) -> Result<()> {
+    send_notification_with_retry_with_context(notification, message, None).await
+}
+
+async fn send_notification_with_retry_with_context(
+    notification: &NotificationResource,
+    message: &str,
+    context: Option<&NotificationContext>,
+) -> Result<()> {
     let mut last_err: Option<anyhow::Error> = None;
     for attempt in 0..NOTIFICATION_MAX_ATTEMPTS {
-        match send_notification(notification, message).await {
+        match send_notification_with_context(notification, message, context).await {
             Ok(()) => return Ok(()),
             Err(err) => {
                 last_err = Some(err);
@@ -60,27 +135,26 @@ pub(crate) fn record_dead_letters(
 ) {
     for (id, result) in results {
         if let Err(err) = result {
-            if let Err(e) = store.record_notification_dead_letter(
-                *id,
-                message,
-                err,
-                NOTIFICATION_MAX_ATTEMPTS,
-            ) {
+            if let Err(e) =
+                store.record_notification_dead_letter(*id, message, err, NOTIFICATION_MAX_ATTEMPTS)
+            {
                 tracing::warn!(notification_id = *id, %e, "failed to persist notification dead-letter");
             }
         }
     }
 }
 
-pub(crate) async fn send_notification(
+async fn send_notification_with_context(
     notification: &NotificationResource,
     message: &str,
+    context: Option<&NotificationContext>,
 ) -> Result<()> {
-    let url = render_template_url(&notification.url, message)?;
+    let format_metric_units = notification.format_metric_units.unwrap_or(false);
+    let url = render_template_url(&notification.url, message, context, format_metric_units)?;
     let pinned_addrs = resolve_allowed_notification_addrs(&url).await?;
 
     let method = request_method(notification.request_method)?;
-    let body = request_body(notification, message)?;
+    let body = request_body(notification, message, context)?;
     let mut builder = Client::builder()
         .redirect(Policy::none())
         .timeout(std::time::Duration::from_secs(30))
@@ -95,7 +169,7 @@ pub(crate) async fn send_notification(
         .context("failed to build notification http client")?;
 
     let mut request = client.request(method, url);
-    request = apply_headers(request, &notification.request_header, message)?;
+    request = apply_headers(request, notification, message, context)?;
     if let Some(body) = body {
         request = request.body(body);
         request = if notification.request_type == REQUEST_TYPE_FORM {
@@ -124,14 +198,21 @@ fn request_method(method: u8) -> Result<Method> {
     }
 }
 
-fn request_body(notification: &NotificationResource, message: &str) -> Result<Option<String>> {
+fn request_body(
+    notification: &NotificationResource,
+    message: &str,
+    context: Option<&NotificationContext>,
+) -> Result<Option<String>> {
     if notification.request_method == REQUEST_METHOD_GET || message.is_empty() {
         return Ok(None);
     }
+    let format_metric_units = notification.format_metric_units.unwrap_or(false);
     match notification.request_type {
         REQUEST_TYPE_JSON => Ok(Some(render_template_json_string(
             &notification.request_body,
             message,
+            context,
+            format_metric_units,
         ))),
         REQUEST_TYPE_FORM => {
             let fields = json_string_map(&notification.request_body)?;
@@ -141,7 +222,12 @@ fn request_body(notification: &NotificationResource, message: &str) -> Result<Op
                     format!(
                         "{}={}",
                         percent_encode(&key),
-                        percent_encode(&render_template_plain(&value, message))
+                        percent_encode(&render_template_plain(
+                            &value,
+                            message,
+                            context,
+                            format_metric_units
+                        ))
                     )
                 })
                 .collect::<Vec<_>>()
@@ -154,39 +240,76 @@ fn request_body(notification: &NotificationResource, message: &str) -> Result<Op
 
 fn apply_headers(
     mut request: reqwest::RequestBuilder,
-    raw_headers: &str,
+    notification: &NotificationResource,
     message: &str,
+    context: Option<&NotificationContext>,
 ) -> Result<reqwest::RequestBuilder> {
+    let raw_headers = &notification.request_header;
     if raw_headers.trim().is_empty() {
         return Ok(request);
     }
+    let format_metric_units = notification.format_metric_units.unwrap_or(false);
     for (key, value) in json_string_map(raw_headers)? {
-        let rendered_value = render_template_plain(&value, message);
+        let rendered_value = render_template_plain(&value, message, context, format_metric_units);
         request = request.header(key, rendered_value);
     }
     Ok(request)
 }
 
-fn render_template_url(raw: &str, message: &str) -> Result<Url> {
-    let rendered = render_template(raw, message, percent_encode);
+fn render_template_url(
+    raw: &str,
+    message: &str,
+    context: Option<&NotificationContext>,
+    format_metric_units: bool,
+) -> Result<Url> {
+    let rendered = render_template(raw, message, context, format_metric_units, percent_encode);
     Url::parse(&rendered).context("invalid notification url")
 }
 
-fn render_template_plain(raw: &str, message: &str) -> String {
-    render_template(raw, message, ToOwned::to_owned)
+fn render_template_plain(
+    raw: &str,
+    message: &str,
+    context: Option<&NotificationContext>,
+    format_metric_units: bool,
+) -> String {
+    render_template(
+        raw,
+        message,
+        context,
+        format_metric_units,
+        ToOwned::to_owned,
+    )
 }
 
-fn render_template_json_string(raw: &str, message: &str) -> String {
-    render_template(raw, message, json_escape)
+fn render_template_json_string(
+    raw: &str,
+    message: &str,
+    context: Option<&NotificationContext>,
+    format_metric_units: bool,
+) -> String {
+    render_template(raw, message, context, format_metric_units, json_escape)
 }
 
-fn render_template(raw: &str, message: &str, message_mod: impl Fn(&str) -> String) -> String {
+fn render_template(
+    raw: &str,
+    message: &str,
+    context: Option<&NotificationContext>,
+    format_metric_units: bool,
+    message_mod: impl Fn(&str) -> String,
+) -> String {
     let now = chrono::Utc::now().to_rfc3339();
-    let context = [
+    let mut values = vec![
         ("#NEZHA#", message_mod(message)),
         ("#DATETIME#", message_mod(&now)),
     ];
-    expand_placeholders(raw, &context)
+    if let Some(server) = context.and_then(|context| context.server.as_ref()) {
+        values.extend(server_template_values(
+            server,
+            format_metric_units,
+            &message_mod,
+        ));
+    }
+    expand_placeholders(raw, &values)
 }
 
 fn expand_placeholders(raw: &str, context: &[(&str, String)]) -> String {
@@ -223,6 +346,77 @@ fn json_string_map(raw: &str) -> Result<Vec<(String, String)>> {
             )
         })
         .collect())
+}
+
+fn server_template_values(
+    server: &ServerTemplateContext,
+    format_metric_units: bool,
+    message_mod: &impl Fn(&str) -> String,
+) -> Vec<(&'static str, String)> {
+    let percent = |value: f64| {
+        if format_metric_units {
+            format!("{value:.2}%")
+        } else {
+            format!("{value:.2}")
+        }
+    };
+    let bytes = |value: u64| {
+        if format_metric_units {
+            format_bytes(value)
+        } else {
+            value.to_string()
+        }
+    };
+    let speed = |value: u64| {
+        if format_metric_units {
+            format!("{}/s", format_bytes(value))
+        } else {
+            value.to_string()
+        }
+    };
+    [
+        ("#SERVER.NAME#", server.name.clone()),
+        ("#SERVER.IP#", server.ip.clone()),
+        ("#SERVER.IPV4#", server.ipv4.clone()),
+        ("#SERVER.IPV6#", server.ipv6.clone()),
+        ("#SERVER.CPU#", percent(server.cpu)),
+        ("#SERVER.MEM#", percent(server.mem)),
+        ("#SERVER.SWAP#", percent(server.swap)),
+        ("#SERVER.DISK#", percent(server.disk)),
+        ("#SERVER.TRANSFERIN#", bytes(server.transfer_in)),
+        ("#SERVER.TRANSFEROUT#", bytes(server.transfer_out)),
+        ("#SERVER.NETINSPEED#", speed(server.net_in_speed)),
+        ("#SERVER.NETOUTSPEED#", speed(server.net_out_speed)),
+        ("#SERVER.LOAD1#", format!("{:.2}", server.load1)),
+        ("#SERVER.LOAD5#", format!("{:.2}", server.load5)),
+        ("#SERVER.LOAD15#", format!("{:.2}", server.load15)),
+    ]
+    .into_iter()
+    .map(|(placeholder, value)| (placeholder, message_mod(&value)))
+    .collect()
+}
+
+fn percentage(used: u64, total: u64) -> f64 {
+    if total == 0 {
+        0.0
+    } else {
+        used as f64 * 100.0 / total as f64
+    }
+}
+
+fn format_bytes(value: u64) -> String {
+    const UNITS: [&str; 6] = ["B", "KB", "MB", "GB", "TB", "PB"];
+    let mut size = value as f64;
+    let mut unit = 0;
+    while size >= 1024.0 && unit + 1 < UNITS.len() {
+        size /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{value} {}", UNITS[unit])
+    } else {
+        format!("{size:.2} {}", UNITS[unit])
+    }
 }
 
 pub(crate) async fn resolve_allowed_notification_addrs(url: &Url) -> Result<Vec<SocketAddr>> {
@@ -341,19 +535,55 @@ mod tests {
     #[test]
     fn replaces_message_for_url_json_and_form_contexts() {
         assert_eq!(
-            render_template_url("https://example.com/?text=#NEZHA#", "hello world")
-                .unwrap()
-                .as_str(),
+            render_template_url(
+                "https://example.com/?text=#NEZHA#",
+                "hello world",
+                None,
+                false
+            )
+            .unwrap()
+            .as_str(),
             "https://example.com/?text=hello%20world"
         );
         assert_eq!(
-            render_template_json_string(r##"{"text":"#NEZHA#"}"##, "hello\nworld"),
+            render_template_json_string(r##"{"text":"#NEZHA#"}"##, "hello\nworld", None, false),
             r#"{"text":"hello\nworld"}"#
         );
         assert_eq!(
-            render_template_plain("msg=#NEZHA#", "hello world"),
+            render_template_plain("msg=#NEZHA#", "hello world", None, false),
             "msg=hello world"
         );
+    }
+
+    #[test]
+    fn server_placeholders_are_rendered_and_metric_units_can_format() {
+        let context = NotificationContext {
+            server: Some(ServerTemplateContext {
+                name: "edge-1".into(),
+                ip: "198.51.100.10/2001:db8::10".into(),
+                ipv4: "198.51.100.10".into(),
+                ipv6: "2001:db8::10".into(),
+                cpu: 12.345,
+                mem: 50.0,
+                swap: 0.0,
+                disk: 75.0,
+                transfer_in: 1024,
+                transfer_out: 1536,
+                net_in_speed: 2048,
+                net_out_speed: 4096,
+                load1: 0.5,
+                load5: 0.25,
+                load15: 0.125,
+            }),
+        };
+        let rendered = render_template_plain(
+            "#SERVER.NAME# #SERVER.CPU# #SERVER.MEM# #SERVER.TRANSFERIN# #SERVER.NETOUTSPEED# #SERVER.LOAD15#",
+            "",
+            Some(&context),
+            true,
+        );
+        assert_eq!(rendered, "edge-1 12.35% 50.00% 1.00 KB 4.00 KB/s 0.12");
+        assert!(!rendered.contains("#SERVER."));
     }
 
     #[test]
@@ -398,7 +628,7 @@ mod tests {
         };
 
         assert_eq!(
-            request_body(&notification, "hello world").unwrap(),
+            request_body(&notification, "hello world", None).unwrap(),
             Some("text=hello%20world".to_string())
         );
     }
@@ -428,7 +658,7 @@ mod tests {
         let raw_headers = r##"{"X-Trace":"req=#NEZHA#"}"##;
         // apply_headers consumes a RequestBuilder; verify rendering by using the same
         // template path the real call site walks.
-        let value = render_template_plain("req=#NEZHA#", "abc");
+        let value = render_template_plain("req=#NEZHA#", "abc", None, false);
         assert_eq!(value, "req=abc");
         // and that json_string_map yields the same key our code would feed in
         let map = json_string_map(raw_headers).unwrap();

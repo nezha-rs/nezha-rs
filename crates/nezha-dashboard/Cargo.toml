@@ -16,6 +16,8 @@ clap.workspace = true
 cron.workspace = true
 futures-util.workspace = true
 hmac = "0.12.1"
+hyper = "1.9.0"
+hyper-util = { version = "0.1.20", features = ["tokio"] }
 include_dir = "0.7.4"
 jsonwebtoken.workspace = true
 maxminddb.workspace = true

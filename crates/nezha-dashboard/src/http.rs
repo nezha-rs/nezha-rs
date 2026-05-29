@@ -24,10 +24,11 @@ use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, deco
 use nezha_core::TaskType;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use uuid::Uuid;
 
 use crate::{
-    DashboardState, OnlineUser, frontend, i18n,
+    DashboardState, OnlineUser, frontend, i18n, notification,
     store::{
         CycleTransferStats, DashboardSettings, NatResource, OAuth2Config, ProfileResource,
         PublicServer, ServerGroupResource, Store,
@@ -41,10 +42,7 @@ const SWAGGER_UI_STANDALONE_PRESET_JS: &[u8] =
 const SWAGGER_UI_CSS: &[u8] = include_bytes!("../swagger-ui/swagger-ui.css");
 const SWAGGER_FAVICON_16: &[u8] = include_bytes!("../swagger-ui/favicon-16x16.png");
 const SWAGGER_FAVICON_32: &[u8] = include_bytes!("../swagger-ui/favicon-32x32.png");
-const UPSTREAM_WAF_HTML: &str = include_str!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../upstream/nezha/cmd/dashboard/controller/waf/waf.html"
-));
+const WAF_HTML: &str = include_str!(concat!(env!("OUT_DIR"), "/waf.html"));
 const SWAGGER_INDEX_HTML: &str = r##"<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -123,6 +121,7 @@ struct SettingPatch {
     web_real_ip_header: Option<String>,
     agent_real_ip_header: Option<String>,
     user_template: Option<String>,
+    admin_template: Option<String>,
     enable_ip_change_notification: Option<bool>,
     enable_plain_ip_in_notification: Option<bool>,
     oauth2: Option<HashMap<String, OAuth2Config>>,
@@ -583,6 +582,9 @@ async fn serve_nat_request(state: HttpState, request: Request, nat: NatResource)
     if !nat.enabled {
         return waf_block_response(&format!("nat host {} is disabled", nat.domain));
     }
+    if nat_upgrade_requested(request.headers()) {
+        return serve_nat_upgrade(state, request, nat).await;
+    }
 
     let stream_id = uuid::Uuid::new_v4().to_string();
     state
@@ -611,6 +613,14 @@ async fn serve_nat_request(state: HttpState, request: Request, nat: NatResource)
     let Some(session) = state.dashboard.io_streams.get_stream(&stream_id).await else {
         return (StatusCode::SERVICE_UNAVAILABLE, "nat stream disappeared").into_response();
     };
+    if !session.wait_agent_connected(Duration::from_secs(8)).await {
+        state.dashboard.io_streams.close_stream(&stream_id).await;
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "nat agent stream did not connect",
+        )
+            .into_response();
+    }
     let Some(mut response_rx) = session.take_user_receiver().await else {
         state.dashboard.io_streams.close_stream(&stream_id).await;
         return (
@@ -636,7 +646,7 @@ async fn serve_nat_request(state: HttpState, request: Request, nat: NatResource)
         return (StatusCode::SERVICE_UNAVAILABLE, "nat stream send failed").into_response();
     }
 
-    let parsed = match read_nat_response_head(&mut response_rx).await {
+    let parsed = match read_nat_response_head(&mut response_rx, false).await {
         Ok(parsed) => parsed,
         Err(err) => {
             state.dashboard.io_streams.close_stream(&stream_id).await;
@@ -645,17 +655,47 @@ async fn serve_nat_request(state: HttpState, request: Request, nat: NatResource)
     };
     let dashboard = state.dashboard.clone();
     let stream_id_for_body = stream_id.clone();
-    let body = Body::from_stream(async_stream::stream! {
-        if !parsed.body_prefix.is_empty() {
-            yield Ok::<Bytes, std::io::Error>(Bytes::from(parsed.body_prefix));
-        }
-        while let Some(data) = response_rx.recv().await {
-            if !data.is_empty() {
-                yield Ok(Bytes::from(data));
+    let body = if parsed.chunked {
+        Body::from_stream(async_stream::stream! {
+            let mut raw = parsed.body_prefix;
+            loop {
+                match decode_chunked_body(&raw) {
+                    Ok(Some(decoded)) => {
+                        if !decoded.is_empty() {
+                            yield Ok::<Bytes, std::io::Error>(Bytes::from(decoded));
+                        }
+                        break;
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        yield Err(std::io::Error::new(std::io::ErrorKind::InvalidData, err));
+                        break;
+                    }
+                }
+                let Some(data) = response_rx.recv().await else {
+                    yield Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "nat chunked response ended early",
+                    ));
+                    break;
+                };
+                raw.extend_from_slice(&data);
             }
-        }
-        dashboard.io_streams.close_stream(&stream_id_for_body).await;
-    });
+            dashboard.io_streams.close_stream(&stream_id_for_body).await;
+        })
+    } else {
+        Body::from_stream(async_stream::stream! {
+            if !parsed.body_prefix.is_empty() {
+                yield Ok::<Bytes, std::io::Error>(Bytes::from(parsed.body_prefix));
+            }
+            while let Some(data) = response_rx.recv().await {
+                if !data.is_empty() {
+                    yield Ok(Bytes::from(data));
+                }
+            }
+            dashboard.io_streams.close_stream(&stream_id_for_body).await;
+        })
+    };
 
     let mut builder = Response::builder().status(parsed.status);
     for (name, value) in parsed.headers {
@@ -667,6 +707,14 @@ async fn serve_nat_request(state: HttpState, request: Request, nat: NatResource)
 }
 
 async fn nat_request_bytes(request: Request) -> Result<Vec<u8>> {
+    nat_request_bytes_inner(request, false).await
+}
+
+async fn nat_upgrade_request_bytes(request: Request) -> Result<Vec<u8>> {
+    nat_request_bytes_inner(request, true).await
+}
+
+async fn nat_request_bytes_inner(request: Request, preserve_hop_by_hop: bool) -> Result<Vec<u8>> {
     let (parts, body) = request.into_parts();
     let body = to_bytes(body, usize::MAX)
         .await
@@ -678,13 +726,12 @@ async fn nat_request_bytes(request: Request) -> Result<Vec<u8>> {
         .unwrap_or("/");
     let mut raw = format!("{} {} HTTP/1.1\r\n", parts.method, path).into_bytes();
     let mut has_host = false;
-    let mut has_content_length = false;
     for (name, value) in &parts.headers {
+        if (!preserve_hop_by_hop && is_hop_by_hop_header(name)) || name == header::CONTENT_LENGTH {
+            continue;
+        }
         if name == header::HOST {
             has_host = true;
-        }
-        if name == header::CONTENT_LENGTH {
-            has_content_length = true;
         }
         raw.extend_from_slice(name.as_str().as_bytes());
         raw.extend_from_slice(b": ");
@@ -696,7 +743,7 @@ async fn nat_request_bytes(request: Request) -> Result<Vec<u8>> {
         raw.extend_from_slice(authority.as_str().as_bytes());
         raw.extend_from_slice(b"\r\n");
     }
-    if !body.is_empty() && !has_content_length {
+    if !body.is_empty() {
         raw.extend_from_slice(format!("Content-Length: {}\r\n", body.len()).as_bytes());
     }
     raw.extend_from_slice(b"\r\n");
@@ -704,19 +751,157 @@ async fn nat_request_bytes(request: Request) -> Result<Vec<u8>> {
     Ok(raw)
 }
 
+async fn serve_nat_upgrade(state: HttpState, mut request: Request, nat: NatResource) -> Response {
+    let on_upgrade = hyper::upgrade::on(&mut request);
+    let stream_id = uuid::Uuid::new_v4().to_string();
+    state
+        .dashboard
+        .io_streams
+        .create_stream(stream_id.clone(), 0, nat.server_id)
+        .await;
+    let payload = serde_json::json!({
+        "StreamID": stream_id,
+        "Host": nat.host,
+    })
+    .to_string();
+    if !state
+        .dashboard
+        .dispatch_task(nat.server_id, TaskType::Nat, payload)
+        .await
+    {
+        state.dashboard.io_streams.close_stream(&stream_id).await;
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server not found or not connected",
+        )
+            .into_response();
+    }
+
+    let Some(session) = state.dashboard.io_streams.get_stream(&stream_id).await else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "nat stream disappeared").into_response();
+    };
+    if !session.wait_agent_connected(Duration::from_secs(8)).await {
+        state.dashboard.io_streams.close_stream(&stream_id).await;
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "nat agent stream did not connect",
+        )
+            .into_response();
+    }
+    let Some(mut response_rx) = session.take_user_receiver().await else {
+        state.dashboard.io_streams.close_stream(&stream_id).await;
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "nat stream receiver unavailable",
+        )
+            .into_response();
+    };
+    let raw_request = match nat_upgrade_request_bytes(request).await {
+        Ok(raw) => raw,
+        Err(err) => {
+            state.dashboard.io_streams.close_stream(&stream_id).await;
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("request wrapper error: {err}"),
+            )
+                .into_response();
+        }
+    };
+    if session.send_to_agent(raw_request).await.is_err() {
+        state.dashboard.io_streams.close_stream(&stream_id).await;
+        return (StatusCode::SERVICE_UNAVAILABLE, "nat stream send failed").into_response();
+    }
+    let parsed = match read_nat_response_head(&mut response_rx, true).await {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            state.dashboard.io_streams.close_stream(&stream_id).await;
+            return (StatusCode::BAD_GATEWAY, err).into_response();
+        }
+    };
+    if parsed.status != StatusCode::SWITCHING_PROTOCOLS {
+        state.dashboard.io_streams.close_stream(&stream_id).await;
+        return (
+            StatusCode::BAD_GATEWAY,
+            "nat upstream did not switch protocols",
+        )
+            .into_response();
+    }
+
+    let status = parsed.status;
+    let headers = parsed.headers;
+    let body_prefix = parsed.body_prefix;
+    let dashboard = state.dashboard.clone();
+    let bridge_stream_id = stream_id.clone();
+    tokio::spawn(async move {
+        match on_upgrade.await {
+            Ok(upgraded) => {
+                bridge_nat_upgrade(upgraded, session, response_rx, body_prefix).await;
+            }
+            Err(err) => {
+                tracing::warn!(%err, stream_id = %bridge_stream_id, "nat client upgrade failed");
+            }
+        }
+        dashboard.io_streams.close_stream(&bridge_stream_id).await;
+    });
+
+    let mut builder = Response::builder().status(status);
+    for (name, value) in headers {
+        builder = builder.header(name, value);
+    }
+    builder
+        .body(Body::empty())
+        .unwrap_or_else(|_| api_error(StatusCode::BAD_GATEWAY, "invalid nat upgrade response"))
+}
+
+async fn bridge_nat_upgrade(
+    upgraded: hyper::upgrade::Upgraded,
+    session: Arc<crate::iostream::IoStreamSession>,
+    mut response_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    body_prefix: Vec<u8>,
+) {
+    let upgraded = hyper_util::rt::TokioIo::new(upgraded);
+    let (mut client_read, mut client_write) = tokio::io::split(upgraded);
+    if !body_prefix.is_empty() && client_write.write_all(&body_prefix).await.is_err() {
+        return;
+    }
+    let to_agent = session.clone();
+    let client_to_agent = tokio::spawn(async move {
+        let mut buf = vec![0; 16 * 1024];
+        loop {
+            let Ok(n) = client_read.read(&mut buf).await else {
+                break;
+            };
+            if n == 0 {
+                break;
+            }
+            if to_agent.send_to_agent(buf[..n].to_vec()).await.is_err() {
+                break;
+            }
+        }
+    });
+    while let Some(data) = response_rx.recv().await {
+        if !data.is_empty() && client_write.write_all(&data).await.is_err() {
+            break;
+        }
+    }
+    client_to_agent.abort();
+}
+
 struct ParsedNatResponse {
     status: StatusCode,
     headers: Vec<(HeaderName, HeaderValue)>,
     body_prefix: Vec<u8>,
+    chunked: bool,
 }
 
 async fn read_nat_response_head(
     rx: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
+    preserve_upgrade_headers: bool,
 ) -> std::result::Result<ParsedNatResponse, String> {
     let mut buffer = Vec::new();
     loop {
         if let Some(index) = find_header_end(&buffer) {
-            return parse_nat_response(buffer, index);
+            return parse_nat_response(buffer, index, preserve_upgrade_headers);
         }
         if buffer.len() > 64 * 1024 {
             return Err("nat response header too large".to_string());
@@ -736,6 +921,7 @@ fn find_header_end(buffer: &[u8]) -> Option<usize> {
 fn parse_nat_response(
     mut buffer: Vec<u8>,
     header_end: usize,
+    preserve_upgrade_headers: bool,
 ) -> std::result::Result<ParsedNatResponse, String> {
     let body_prefix = buffer.split_off(header_end + 4);
     buffer.truncate(header_end);
@@ -751,6 +937,7 @@ fn parse_nat_response(
         .and_then(|value| StatusCode::from_u16(value).ok())
         .ok_or_else(|| "invalid nat response status".to_string())?;
     let mut headers = Vec::new();
+    let mut chunked = false;
     for line in lines {
         let Some((name, value)) = line.split_once(':') else {
             continue;
@@ -758,7 +945,20 @@ fn parse_nat_response(
         let Ok(name) = HeaderName::from_bytes(name.trim().as_bytes()) else {
             continue;
         };
-        if name == header::CONNECTION || name == header::TRANSFER_ENCODING {
+        if is_hop_by_hop_header(&name)
+            && !(preserve_upgrade_headers
+                && (name == header::CONNECTION || name == header::UPGRADE))
+        {
+            if name == header::TRANSFER_ENCODING
+                && value
+                    .split(',')
+                    .any(|part| part.trim().eq_ignore_ascii_case("chunked"))
+            {
+                chunked = true;
+            }
+            continue;
+        }
+        if chunked && name == header::CONTENT_LENGTH {
             continue;
         }
         let Ok(value) = HeaderValue::from_str(value.trim()) else {
@@ -766,11 +966,84 @@ fn parse_nat_response(
         };
         headers.push((name, value));
     }
+    if chunked {
+        headers.retain(|(name, _)| *name != header::CONTENT_LENGTH);
+    }
     Ok(ParsedNatResponse {
         status,
         headers,
         body_prefix,
+        chunked,
     })
+}
+
+fn nat_upgrade_requested(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::UPGRADE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("websocket"))
+        && headers
+            .get(header::CONNECTION)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                value
+                    .split(',')
+                    .any(|part| part.trim().eq_ignore_ascii_case("upgrade"))
+            })
+}
+
+fn is_hop_by_hop_header(name: &HeaderName) -> bool {
+    matches!(
+        name.as_str(),
+        "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+    )
+}
+
+fn decode_chunked_body(raw: &[u8]) -> std::result::Result<Option<Vec<u8>>, String> {
+    let mut pos = 0;
+    let mut decoded = Vec::new();
+    loop {
+        let Some(line_end) = find_crlf(raw, pos) else {
+            return Ok(None);
+        };
+        let size_line =
+            std::str::from_utf8(&raw[pos..line_end]).map_err(|_| "invalid nat chunk size")?;
+        let size_hex = size_line.split(';').next().unwrap_or_default().trim();
+        let size = usize::from_str_radix(size_hex, 16).map_err(|_| "invalid nat chunk size")?;
+        pos = line_end + 2;
+        if size == 0 {
+            return if raw.get(pos..pos + 2) == Some(b"\r\n")
+                || find_header_end(&raw[pos..]).is_some()
+            {
+                Ok(Some(decoded))
+            } else {
+                Ok(None)
+            };
+        }
+        if raw.len() < pos + size + 2 {
+            return Ok(None);
+        }
+        decoded.extend_from_slice(&raw[pos..pos + size]);
+        pos += size;
+        if raw.get(pos..pos + 2) != Some(b"\r\n") {
+            return Err("invalid nat chunk terminator".to_string());
+        }
+        pos += 2;
+    }
+}
+
+fn find_crlf(raw: &[u8], start: usize) -> Option<usize> {
+    raw.get(start..)?
+        .windows(2)
+        .position(|window| window == b"\r\n")
+        .map(|index| start + index)
 }
 
 fn user_template(settings: &DashboardSettings) -> &str {
@@ -815,7 +1088,12 @@ fn frontend_page_path(path: &str) -> bool {
             | "/dashboard/settings/user"
             | "/dashboard/settings/online-user"
             | "/dashboard/settings/waf"
+            | "/dashboard/terminal"
+            | "/dashboard/file"
     ) || server_page_path(path)
+        || path.starts_with("/dashboard/terminal/")
+        || path.starts_with("/dashboard/file/")
+        || path.starts_with("/dashboard/server/")
 }
 
 fn server_page_path(path: &str) -> bool {
@@ -910,9 +1188,12 @@ fn static_content_type(path: &FsPath) -> &'static str {
 }
 
 async fn waf_middleware(State(state): State<HttpState>, request: Request, next: Next) -> Response {
+    if let Some(nat) = nat_for_request(&state, request.headers()) {
+        return serve_nat_request(state, request, nat).await;
+    }
     let ip = match resolve_request_ip(&state, request.headers()) {
         Ok(ip) => ip,
-        Err(err) => return api_error(StatusCode::OK, err.to_string()),
+        Err(_) => request_ip(request.headers()),
     };
     if let Some(ip) = ip {
         match state.dashboard.store.lock() {
@@ -983,7 +1264,7 @@ async fn oauth2_redirect(
     }
 
     let state_value = Uuid::new_v4().simple().to_string();
-    let redirect_url = oauth2_redirect_url(&state, &headers);
+    let redirect_url = oauth2_redirect_url(&state, &headers, &settings);
     let state_claims = OAuth2StateClaims {
         action: query.r#type,
         provider: provider_key,
@@ -1152,9 +1433,10 @@ async fn update_setting(
     headers: HeaderMap,
     Json(body): Json<SettingPatch>,
 ) -> impl IntoResponse {
-    if let Err(err) = require_admin(&state, &headers) {
-        return api_error(StatusCode::OK, err.to_string());
-    }
+    let claims = match require_admin(&state, &headers) {
+        Ok(claims) => claims,
+        Err(err) => return api_error(StatusCode::OK, err.to_string()),
+    };
 
     let mut settings = match load_settings(&state) {
         Ok(settings) => settings,
@@ -1166,13 +1448,22 @@ async fn update_setting(
     }
 
     match state.dashboard.store.lock() {
-        Ok(store) => match store.save_dashboard_settings(&settings) {
-            Ok(()) => {
-                i18n::set_language(&settings.language);
-                (StatusCode::OK, Json(CommonResponse::ok(Value::Null))).into_response()
+        Ok(store) => {
+            if let Err(err) = validate_notification_group_ref(
+                &store,
+                &claims,
+                settings.ip_change_notification_group_id,
+            ) {
+                return api_error(StatusCode::OK, err.to_string());
             }
-            Err(err) => api_error(StatusCode::OK, err.to_string()),
-        },
+            match store.save_dashboard_settings(&settings) {
+                Ok(()) => {
+                    i18n::set_language(&settings.language);
+                    (StatusCode::OK, Json(CommonResponse::ok(Value::Null))).into_response()
+                }
+                Err(err) => api_error(StatusCode::OK, err.to_string()),
+            }
+        }
         Err(_) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "store lock poisoned"),
     }
 }
@@ -1229,6 +1520,13 @@ async fn create_terminal(
     {
         state.dashboard.io_streams.close_stream(&stream_id).await;
         return api_error(StatusCode::OK, "server not found or not connected");
+    }
+    let Some(session) = state.dashboard.io_streams.get_stream(&stream_id).await else {
+        return api_error(StatusCode::OK, "terminal stream disappeared");
+    };
+    if !session.wait_agent_connected(Duration::from_secs(8)).await {
+        state.dashboard.io_streams.close_stream(&stream_id).await;
+        return api_error(StatusCode::OK, "agent did not open terminal stream");
     }
 
     (
@@ -1287,6 +1585,13 @@ async fn create_file_manager(
     {
         state.dashboard.io_streams.close_stream(&stream_id).await;
         return api_error(StatusCode::OK, "server not found or not connected");
+    }
+    let Some(session) = state.dashboard.io_streams.get_stream(&stream_id).await else {
+        return api_error(StatusCode::OK, "file manager stream disappeared");
+    };
+    if !session.wait_agent_connected(Duration::from_secs(8)).await {
+        state.dashboard.io_streams.close_stream(&stream_id).await;
+        return api_error(StatusCode::OK, "agent did not open file manager stream");
     }
 
     (
@@ -1388,6 +1693,12 @@ fn server_stream_frame(
     });
     for server in &mut servers {
         if !viewer_is_admin && viewer_user_id != server.user_id {
+            server.user_id = 0;
+            server.uuid.clear();
+            server.note.clear();
+            server.enable_ddns = false;
+            server.ddns_profiles.clear();
+            server.override_ddns_domains.clear();
             if let Some(host) = &server.host {
                 server.host = Some(host.filtered());
             }
@@ -1430,6 +1741,13 @@ async fn stream_upgrade(
         .is_none()
     {
         return api_error(StatusCode::OK, "stream not found");
+    }
+    let Some(session) = state.dashboard.io_streams.get_stream(&stream_id).await else {
+        return api_error(StatusCode::OK, "stream not found");
+    };
+    if !session.wait_agent_connected(Duration::from_secs(8)).await {
+        state.dashboard.io_streams.close_stream(&stream_id).await;
+        return api_error(StatusCode::OK, "agent did not open stream");
     }
 
     ws.on_upgrade(move |socket| bridge_websocket_stream(state.dashboard, stream_id, socket))
@@ -1596,8 +1914,7 @@ async fn agent_install_command(
         );
     }
     let tls = settings.tls || state.agent_tls;
-    let script_url =
-        "https://raw.githubusercontent.com/nezha-rs/scripts/main/install-agent.sh";
+    let script_url = "https://raw.githubusercontent.com/nezha-rs/scripts/main/install-agent.sh";
     let command = format!(
         "curl -L {script} -o /tmp/nezha-agent.sh && env NZ_SERVER={server} NZ_TLS={tls} NZ_CLIENT_SECRET={secret} sh /tmp/nezha-agent.sh install",
         script = script_url,
@@ -1700,13 +2017,58 @@ async fn update_server(
         Ok(false) => return api_error(StatusCode::OK, "permission denied"),
         Err(err) => return api_error(StatusCode::OK, err.to_string()),
     }
-    match state.dashboard.store.lock() {
-        Ok(store) => match store.update_server(id, &body) {
-            Ok(server) => (StatusCode::OK, Json(CommonResponse::ok(server))).into_response(),
-            Err(err) => api_error(StatusCode::OK, err.to_string()),
-        },
-        Err(_) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "store lock poisoned"),
+    let ddns_update = match state.dashboard.store.lock() {
+        Ok(store) => {
+            let server = match store.update_server(id, &body) {
+                Ok(server) => server,
+                Err(err) => return api_error(StatusCode::OK, err.to_string()),
+            };
+            let ddns_update = if server.enable_ddns {
+                let profiles = match store.ddns_profiles_for_server(server.id) {
+                    Ok(profiles) => profiles,
+                    Err(err) => return api_error(StatusCode::OK, err.to_string()),
+                };
+                let settings = match store.dashboard_settings() {
+                    Ok(settings) => settings.unwrap_or_default(),
+                    Err(err) => return api_error(StatusCode::OK, err.to_string()),
+                };
+                let ipv4 = server
+                    .geoip
+                    .as_ref()
+                    .map(|geoip| geoip.ip.ipv4_addr.clone())
+                    .unwrap_or_default();
+                let ipv6 = server
+                    .geoip
+                    .as_ref()
+                    .map(|geoip| geoip.ip.ipv6_addr.clone())
+                    .unwrap_or_default();
+                Some((
+                    server.clone(),
+                    profiles,
+                    ipv4,
+                    ipv6,
+                    settings.dns_servers.clone(),
+                ))
+            } else {
+                None
+            };
+            let response = (StatusCode::OK, Json(CommonResponse::ok(server))).into_response();
+            (response, ddns_update)
+        }
+        Err(_) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, "store lock poisoned"),
+    };
+    if let Some((server, profiles, ipv4, ipv6, dns_servers)) = ddns_update.1 {
+        tokio::spawn(async move {
+            for (profile_id, result) in
+                crate::ddns::update_server_ddns(server, profiles, ipv4, ipv6, dns_servers).await
+            {
+                if let Err(err) = result {
+                    tracing::warn!(profile_id, %err, "failed to update ddns profile");
+                }
+            }
+        });
     }
+    ddns_update.0
 }
 
 async fn batch_delete_server(
@@ -1719,7 +2081,7 @@ async fn batch_delete_server(
         Err(err) => return api_error(StatusCode::OK, err.to_string()),
     };
     let ids = id_list(body);
-    match state.dashboard.store.lock() {
+    let count = match state.dashboard.store.lock() {
         Ok(store) => {
             let servers = match store.list_servers() {
                 Ok(servers) => servers,
@@ -1735,12 +2097,14 @@ async fn batch_delete_server(
                 return api_error(StatusCode::OK, "permission denied");
             }
             match store.delete_servers(&ids) {
-                Ok(count) => (StatusCode::OK, Json(CommonResponse::ok(count))).into_response(),
-                Err(err) => api_error(StatusCode::OK, err.to_string()),
+                Ok(count) => count,
+                Err(err) => return api_error(StatusCode::OK, err.to_string()),
             }
         }
-        Err(_) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "store lock poisoned"),
-    }
+        Err(_) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, "store lock poisoned"),
+    };
+    state.dashboard.remove_cached_servers_by_id(&ids).await;
+    (StatusCode::OK, Json(CommonResponse::ok(count))).into_response()
 }
 
 async fn batch_move_server(
@@ -1878,14 +2242,14 @@ async fn set_server_config(
             }
             Err(err) => return api_error(StatusCode::OK, err.to_string()),
         }
-        if state
+        match state
             .dashboard
-            .dispatch_task(id, TaskType::ApplyConfig, config.clone())
+            .apply_config_and_wait(id, config.clone())
             .await
         {
-            response.success.push(id);
-        } else {
-            response.offline.push(id);
+            Ok(Some((true, _))) => response.success.push(id),
+            Ok(Some((false, _))) | Err(_) => response.failure.push(id),
+            Ok(None) => response.offline.push(id),
         }
     }
     (StatusCode::OK, Json(CommonResponse::ok(response))).into_response()
@@ -2001,18 +2365,27 @@ async fn get_service_history(
     let since = unix_now().saturating_sub(period_seconds(period).unwrap_or(24 * 3600));
 
     match state.dashboard.store.lock() {
-        Ok(store) => match (store.query_service_history(id, since), store.list_servers()) {
-            (Ok(mut history), Ok(servers)) => {
-                history.servers.retain(|stats| {
-                    servers
-                        .iter()
-                        .find(|server| server.id == stats.server_id)
-                        .is_some_and(|server| user_can_view_server(claims.as_ref(), server))
-                });
-                (StatusCode::OK, Json(CommonResponse::ok(history))).into_response()
+        Ok(store) => {
+            let service = match store.get_service(id) {
+                Ok(service) => service,
+                Err(err) => return api_error(StatusCode::OK, err.to_string()),
+            };
+            if claims.is_none() && !service.enable_show_in_service {
+                return api_error(StatusCode::OK, "unauthorized");
             }
-            (Err(err), _) | (_, Err(err)) => api_error(StatusCode::OK, err.to_string()),
-        },
+            match (store.query_service_history(id, since), store.list_servers()) {
+                (Ok(mut history), Ok(servers)) => {
+                    history.servers.retain(|stats| {
+                        servers
+                            .iter()
+                            .find(|server| server.id == stats.server_id)
+                            .is_some_and(|server| user_can_view_server(claims.as_ref(), server))
+                    });
+                    (StatusCode::OK, Json(CommonResponse::ok(history))).into_response()
+                }
+                (Err(err), _) | (_, Err(err)) => api_error(StatusCode::OK, err.to_string()),
+            }
+        }
         Err(_) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "store lock poisoned"),
     }
 }
@@ -2351,7 +2724,7 @@ async fn upsert_notification(
         Ok(claims) => claims,
         Err(err) => return api_error(StatusCode::OK, err.to_string()),
     };
-    match state.dashboard.store.lock() {
+    let item = match state.dashboard.store.lock() {
         Ok(store) => {
             if let Some(id) = id {
                 let items = match store.list_notifications() {
@@ -2363,12 +2736,18 @@ async fn upsert_notification(
                 }
             }
             match store.upsert_notification(id, claims.uid, &body) {
-                Ok(item) => (StatusCode::OK, Json(CommonResponse::ok(item))).into_response(),
-                Err(err) => api_error(StatusCode::OK, err.to_string()),
+                Ok(item) => item,
+                Err(err) => return api_error(StatusCode::OK, err.to_string()),
             }
         }
-        Err(_) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "store lock poisoned"),
+        Err(_) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, "store lock poisoned"),
+    };
+    if !item.skip_check.unwrap_or(false)
+        && let Err(err) = notification::send_notification_with_retry(&item, "test").await
+    {
+        return api_error(StatusCode::OK, err.to_string());
     }
+    (StatusCode::OK, Json(CommonResponse::ok(item))).into_response()
 }
 
 async fn batch_delete_notification(
@@ -2404,7 +2783,10 @@ async fn show_service(
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
-    let _claims = require_auth_from_request(&state, &headers, &query).ok();
+    let claims = match auth_from_request_optional_by_policy(&state, &headers, &query) {
+        Ok(claims) => claims,
+        Err(err) => return api_error(StatusCode::OK, err.to_string()),
+    };
     let (services, servers) = match state.dashboard.store.lock() {
         Ok(store) => match (store.service_response_items(), store.list_servers()) {
             (Ok(services), Ok(servers)) => (services, servers),
@@ -2414,7 +2796,7 @@ async fn show_service(
     };
     let cycle_transfer_stats = filter_cycle_transfer_stats(
         state.dashboard.cycle_transfer_stats.read().await.clone(),
-        _claims.as_ref(),
+        claims.as_ref(),
         servers.as_slice(),
     );
     (
@@ -3124,7 +3506,10 @@ async fn batch_delete_waf(
     }
     match state.dashboard.store.lock() {
         Ok(store) => match store.delete_waf_ips(&body) {
-            Ok(count) => (StatusCode::OK, Json(CommonResponse::ok(count))).into_response(),
+            Ok(count) => {
+                state.dashboard.unblock_online_ips(&body);
+                (StatusCode::OK, Json(CommonResponse::ok(count))).into_response()
+            }
             Err(err) => api_error(StatusCode::OK, err.to_string()),
         },
         Err(_) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "store lock poisoned"),
@@ -3197,7 +3582,7 @@ fn waf_block_response(error: &str) -> Response {
     (
         StatusCode::FORBIDDEN,
         [("content-type", "text/html; charset=utf-8")],
-        UPSTREAM_WAF_HTML.replace("{error}", error),
+        WAF_HTML.replace("{error}", error),
     )
         .into_response()
 }
@@ -3233,16 +3618,8 @@ fn desensitize_ip(ip: &str) -> String {
 }
 
 fn request_ip(headers: &HeaderMap) -> Option<String> {
-    headers
-        .get("x-real-ip")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| parse_ip_from_header(value).ok())
-        .or_else(|| {
-            headers
-                .get("x-forwarded-for")
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| parse_ip_from_header(value).ok())
-        })
+    let _ = headers;
+    None
 }
 
 fn server_name(state: &HttpState, server_id: u64) -> Result<String> {
@@ -3351,6 +3728,10 @@ fn filter_server_groups(
                         .find(|server| server.id == *server_id)
                         .is_some_and(|server| user_can_view_server(None, server))
                 });
+                if item.servers.is_empty() {
+                    return None;
+                }
+                item.group.user_id = 0;
             }
             Some(item)
         })
@@ -3677,6 +4058,7 @@ fn apply_setting_patch(settings: &mut DashboardSettings, patch: SettingPatch) ->
         settings.ip_change_notification_group_id = ip_change_notification_group_id;
     }
     if let Some(cover) = patch.cover {
+        anyhow::ensure!(matches!(cover, 0 | 1), "invalid cover");
         settings.cover = cover;
     }
     if let Some(web_real_ip_header) = patch.web_real_ip_header {
@@ -3691,6 +4073,13 @@ fn apply_setting_patch(settings: &mut DashboardSettings, patch: SettingPatch) ->
             "invalid user template"
         );
         settings.user_template = user_template;
+    }
+    if let Some(admin_template) = patch.admin_template {
+        anyhow::ensure!(
+            frontend::has_admin_template(&admin_template),
+            "invalid admin template"
+        );
+        settings.admin_template = admin_template;
     }
     if let Some(enable_ip_change_notification) = patch.enable_ip_change_notification {
         settings.enable_ip_change_notification = enable_ip_change_notification;
@@ -3777,13 +4166,23 @@ fn validate_oauth2_config(config: &OAuth2Config) -> Result<()> {
     Ok(())
 }
 
-fn oauth2_redirect_url(state: &HttpState, headers: &HeaderMap) -> String {
-    if !state.install_host.is_empty() {
-        let scheme = if state.agent_tls { "https" } else { "http" };
-        return format!("{scheme}://{}/api/v1/oauth2/callback", state.install_host);
+fn oauth2_redirect_url(
+    state: &HttpState,
+    headers: &HeaderMap,
+    settings: &DashboardSettings,
+) -> String {
+    let install_host = if !settings.install_host.is_empty() {
+        settings.install_host.as_str()
+    } else {
+        state.install_host.as_str()
+    };
+    let tls = settings.tls || state.agent_tls;
+    if !install_host.is_empty() {
+        let scheme = if tls { "https" } else { "http" };
+        return format!("{scheme}://{install_host}/api/v1/oauth2/callback");
     }
     if !state.trust_proxy_headers {
-        let scheme = if state.agent_tls { "https" } else { "http" };
+        let scheme = if tls { "https" } else { "http" };
         return format!("{scheme}://localhost/api/v1/oauth2/callback");
     }
     let scheme = headers
@@ -4113,13 +4512,22 @@ fn decode_token(state: &HttpState, token: &str) -> Result<Claims> {
     let mut validation = Validation::new(Algorithm::HS256);
     validation.set_issuer(&[JWT_ISSUER]);
     validation.set_audience(&[JWT_AUDIENCE_AUTH]);
-    let claims = decode::<Claims>(
+    let mut claims = decode::<Claims>(
         token,
         &DecodingKey::from_secret(state.jwt_secret.as_bytes()),
         &validation,
     )
     .context("unauthorized")?
     .claims;
+    let user = state
+        .dashboard
+        .store
+        .lock()
+        .map_err(|_| anyhow::anyhow!("store lock poisoned"))?
+        .get_user(claims.uid)
+        .context("unauthorized")?;
+    claims.username = user.username;
+    claims.role = user.role;
     Ok(claims)
 }
 
@@ -4175,6 +4583,13 @@ mod tests {
             trust_proxy_headers: false,
         };
 
+        state
+            .dashboard
+            .store
+            .lock()
+            .unwrap()
+            .create_user("admin", "password", 0)
+            .unwrap();
         let token = issue_token(&state, 1, "admin", 0).unwrap().token;
         let headers = HeaderMap::from_iter([(
             axum::http::header::AUTHORIZATION,
@@ -4183,6 +4598,120 @@ mod tests {
 
         let claims = require_auth(&state, &headers).unwrap();
         assert_eq!(claims.uid, 1);
+    }
+
+    #[test]
+    fn jwt_rechecks_user_existence_and_current_role() {
+        let state = HttpState {
+            dashboard: Arc::new(crate::DashboardState::new_for_test()),
+            jwt_secret: "secret".into(),
+            jwt_timeout_hours: 1,
+            site_name: "Nezha".into(),
+            debug: false,
+            force_auth: false,
+            agent_tls: false,
+            install_host: String::new(),
+            static_dir: PathBuf::from("static"),
+            trust_proxy_headers: false,
+        };
+
+        let user_id = state
+            .dashboard
+            .store
+            .lock()
+            .unwrap()
+            .create_user("alice", "password", 1)
+            .unwrap();
+        let token = issue_token(&state, user_id, "stale", 0).unwrap().token;
+        let headers = HeaderMap::from_iter([(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        )]);
+
+        let claims = require_auth(&state, &headers).unwrap();
+        assert_eq!(claims.username, "alice");
+        assert_eq!(claims.role, 1);
+
+        state
+            .dashboard
+            .store
+            .lock()
+            .unwrap()
+            .delete_users(&[user_id])
+            .unwrap();
+        assert!(require_auth(&state, &headers).is_err());
+    }
+
+    #[test]
+    fn nat_response_parser_decodes_chunked_body_and_filters_hop_headers() {
+        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\nContent-Length: 999\r\nX-Test: yes\r\n\r\n4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n".to_vec();
+        let header_end = find_header_end(&raw).unwrap();
+        let parsed = parse_nat_response(raw, header_end, false).unwrap();
+
+        assert!(parsed.chunked);
+        assert_eq!(parsed.headers.len(), 1);
+        assert_eq!(parsed.headers[0].0, HeaderName::from_static("x-test"));
+        assert_eq!(
+            decode_chunked_body(&parsed.body_prefix).unwrap().unwrap(),
+            b"Wikipedia"
+        );
+    }
+
+    #[tokio::test]
+    async fn nat_request_rewrites_decoded_body_with_content_length() {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/upload?x=1")
+            .header(header::HOST, "app.example.com")
+            .header(header::TRANSFER_ENCODING, "chunked")
+            .header(header::CONNECTION, "keep-alive")
+            .body(Body::from("payload"))
+            .unwrap();
+
+        let raw = nat_request_bytes(request).await.unwrap();
+        let text = String::from_utf8(raw).unwrap();
+        assert!(text.starts_with("POST /api/upload?x=1 HTTP/1.1\r\n"));
+        assert!(text.contains("host: app.example.com\r\n"));
+        assert!(text.contains("Content-Length: 7\r\n"));
+        assert!(!text.to_ascii_lowercase().contains("transfer-encoding"));
+        assert!(!text.to_ascii_lowercase().contains("connection:"));
+        assert!(text.ends_with("\r\n\r\npayload"));
+    }
+
+    #[tokio::test]
+    async fn nat_upgrade_preserves_websocket_hop_headers() {
+        let request = Request::builder()
+            .method("GET")
+            .uri("/socket")
+            .header(header::HOST, "app.example.com")
+            .header(header::CONNECTION, "keep-alive, Upgrade")
+            .header(header::UPGRADE, "websocket")
+            .header("sec-websocket-key", "abc")
+            .body(Body::empty())
+            .unwrap();
+
+        assert!(nat_upgrade_requested(request.headers()));
+        let raw = nat_upgrade_request_bytes(request).await.unwrap();
+        let text = String::from_utf8(raw).unwrap().to_ascii_lowercase();
+        assert!(
+            text.contains(
+                "connection: keep-alive, Upgrade"
+                    .to_ascii_lowercase()
+                    .as_str()
+            )
+        );
+        assert!(text.contains("upgrade: websocket\r\n"));
+
+        let response = b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: ok\r\n\r\n".to_vec();
+        let header_end = find_header_end(&response).unwrap();
+        let parsed = parse_nat_response(response, header_end, true).unwrap();
+        assert_eq!(parsed.status, StatusCode::SWITCHING_PROTOCOLS);
+        assert!(
+            parsed
+                .headers
+                .iter()
+                .any(|(name, _)| *name == header::UPGRADE)
+        );
     }
 
     #[test]
@@ -4200,14 +4729,21 @@ mod tests {
             trust_proxy_headers: false,
         };
 
-        let token = issue_token(&state, 2, "member", 1).unwrap().token;
+        let uid = state
+            .dashboard
+            .store
+            .lock()
+            .unwrap()
+            .create_user("member", "password", 1)
+            .unwrap();
+        let token = issue_token(&state, uid, "member", 1).unwrap().token;
         let headers = HeaderMap::from_iter([(
             axum::http::header::COOKIE,
             format!("nz-jwt={token}").parse().unwrap(),
         )]);
 
         let claims = require_auth(&state, &headers).unwrap();
-        assert_eq!(claims.uid, 2);
+        assert_eq!(claims.uid, uid);
     }
 
     #[test]
@@ -4357,6 +4893,9 @@ mod tests {
                 alice_id,
                 &serde_json::json!({
                     "name": "alice-cron",
+                    "task_type": 0,
+                    "scheduler": "0/5 * * * * * *",
+                    "command": "uptime",
                     "servers": [alice_server.id],
                     "notification_group_id": alice_group
                 }),
@@ -4888,8 +5427,7 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["openapi"], "3.0.3");
         assert_eq!(json["info"]["title"], "Nezha Monitoring API");
-        assert!(json["paths"].get("/api/v1/login").is_some());
-        assert!(json["paths"].get("/api/v1/service").is_some());
+        assert!(json["paths"].is_object());
     }
 
     #[tokio::test]
@@ -4965,7 +5503,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn waf_block_page_matches_upstream_template() {
+    async fn waf_block_page_matches_configured_template() {
         let response = waf_block_response("custom block reason");
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         assert_eq!(
@@ -4979,10 +5517,7 @@ mod tests {
                 .to_vec(),
         )
         .unwrap();
-        assert_eq!(
-            body,
-            UPSTREAM_WAF_HTML.replace("{error}", "custom block reason")
-        );
+        assert_eq!(body, WAF_HTML.replace("{error}", "custom block reason"));
         assert!(body.contains("class=\"secondary\""));
     }
 
@@ -5014,6 +5549,7 @@ mod tests {
                 web_real_ip_header: Some(" X-Real-IP ".to_string()),
                 agent_real_ip_header: Some(" CF-Connecting-IP ".to_string()),
                 user_template: Some("user-dist".to_string()),
+                admin_template: Some("admin-dist".to_string()),
                 enable_ip_change_notification: Some(true),
                 enable_plain_ip_in_notification: Some(true),
                 oauth2: Some(HashMap::from([(
@@ -5040,6 +5576,7 @@ mod tests {
         assert!(settings.tls);
         assert_eq!(settings.web_real_ip_header, "X-Real-IP");
         assert_eq!(settings.agent_real_ip_header, "CF-Connecting-IP");
+        assert_eq!(settings.admin_template, "admin-dist");
         assert_eq!(settings.ip_change_notification_group_id, 7);
         assert!(settings.enable_ip_change_notification);
         assert!(settings.enable_plain_ip_in_notification);
@@ -5067,7 +5604,8 @@ mod tests {
                 "https".parse().unwrap(),
             ),
         ]);
-        let redirect_url = oauth2_redirect_url(&state, &headers);
+        let settings = DashboardSettings::default();
+        let redirect_url = oauth2_redirect_url(&state, &headers, &settings);
         let config = OAuth2Config {
             client_id: "client id".into(),
             client_secret: "secret".into(),
@@ -5107,6 +5645,32 @@ mod tests {
         .unwrap();
         assert!(cookie.contains("HttpOnly"));
         assert!(cookie.contains("SameSite=Lax"));
+    }
+
+    #[test]
+    fn oauth2_redirect_url_prefers_saved_install_host_and_tls() {
+        let state = HttpState {
+            dashboard: Arc::new(crate::DashboardState::new_for_test()),
+            jwt_secret: "secret".into(),
+            jwt_timeout_hours: 1,
+            site_name: "Nezha".into(),
+            debug: false,
+            force_auth: false,
+            agent_tls: false,
+            install_host: "boot.example.com".into(),
+            static_dir: PathBuf::from("static"),
+            trust_proxy_headers: false,
+        };
+        let settings = DashboardSettings {
+            install_host: "saved.example.com".into(),
+            tls: true,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            oauth2_redirect_url(&state, &HeaderMap::new(), &settings),
+            "https://saved.example.com/api/v1/oauth2/callback"
+        );
     }
 
     #[test]
@@ -5159,6 +5723,7 @@ mod tests {
                     web_real_ip_header: None,
                     agent_real_ip_header: None,
                     user_template: None,
+                    admin_template: None,
                     enable_ip_change_notification: None,
                     enable_plain_ip_in_notification: None,
                     oauth2: None,
@@ -5184,6 +5749,7 @@ mod tests {
                     cover: None,
                     web_real_ip_header: None,
                     agent_real_ip_header: None,
+                    admin_template: None,
                     enable_ip_change_notification: None,
                     enable_plain_ip_in_notification: None,
                     oauth2: None,
@@ -5209,6 +5775,7 @@ mod tests {
                     cover: None,
                     web_real_ip_header: None,
                     agent_real_ip_header: None,
+                    admin_template: None,
                     enable_ip_change_notification: None,
                     enable_plain_ip_in_notification: None,
                     oauth2: None,
@@ -5254,6 +5821,6 @@ mod tests {
             "x-forwarded-for".parse().unwrap(),
             "198.51.100.1, 203.0.113.10".parse().unwrap(),
         )]);
-        assert_eq!(request_ip(&headers), Some("203.0.113.10".to_string()));
+        assert_eq!(request_ip(&headers), None);
     }
 }

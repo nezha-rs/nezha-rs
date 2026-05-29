@@ -10,6 +10,8 @@ use anyhow::{Context, Result};
 use nezha_core::AgentConfig;
 
 const BINARY_NAME: &str = "nezha-agent";
+const RELEASE_REPO_OWNER: &str = "nezha-rs";
+const RELEASE_REPO_NAME: &str = "nezha-rs";
 const AUTO_CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const FORCE_BASELINE_VERSION: &str = "0.1.0";
 const MIN_UPDATE_INTERVAL_MINUTES: u64 = 1440;
@@ -108,18 +110,19 @@ fn run_blocking(cfg: &AgentConfig, mode: UpdateMode) -> Result<UpdateOutcome> {
         UpdateLock::WaitedForPeer => {
             return Ok(UpdateOutcome {
                 provider,
-                updated: true,
+                updated: false,
                 version: current_version.to_string(),
             });
         }
     };
 
+    let release_target = rust_release_target();
     let status = match provider {
         UpdateProvider::GitHub => ::self_update::backends::github::Update::configure()
-            .repo_owner("nezhahq")
-            .repo_name("agent")
+            .repo_owner(RELEASE_REPO_OWNER)
+            .repo_name(RELEASE_REPO_NAME)
             .bin_name(BINARY_NAME)
-            .target(&go_release_target())
+            .target(&release_target)
             .show_download_progress(false)
             .show_output(false)
             .no_confirm(true)
@@ -128,10 +131,10 @@ fn run_blocking(cfg: &AgentConfig, mode: UpdateMode) -> Result<UpdateOutcome> {
             .update()?,
         UpdateProvider::Gitee => ::self_update::backends::gitea::Update::configure()
             .with_host("https://gitee.com")
-            .repo_owner("naibahq")
-            .repo_name("agent")
+            .repo_owner(RELEASE_REPO_OWNER)
+            .repo_name(RELEASE_REPO_NAME)
             .bin_name(BINARY_NAME)
-            .target(&go_release_target())
+            .target(&release_target)
             .show_download_progress(false)
             .show_output(false)
             .no_confirm(true)
@@ -140,10 +143,10 @@ fn run_blocking(cfg: &AgentConfig, mode: UpdateMode) -> Result<UpdateOutcome> {
             .update()?,
         UpdateProvider::AtomGit => ::self_update::backends::gitea::Update::configure()
             .with_host("https://api.atomgit.com")
-            .repo_owner("naiba")
-            .repo_name("nezha-agent")
+            .repo_owner(RELEASE_REPO_OWNER)
+            .repo_name(RELEASE_REPO_NAME)
             .bin_name(BINARY_NAME)
-            .target(&go_release_target())
+            .target(&release_target)
             .show_download_progress(false)
             .show_output(false)
             .no_confirm(true)
@@ -179,7 +182,7 @@ fn version_looks_semver(version: &str) -> bool {
         .all(|part| !part.is_empty() && part.chars().all(|ch| ch.is_ascii_digit()))
 }
 
-fn go_release_target() -> String {
+fn rust_release_target() -> String {
     format!("{}_{}", goos(), goarch())
 }
 
@@ -333,8 +336,14 @@ mod tests {
     }
 
     #[test]
-    fn release_target_uses_goreleaser_os_arch_names() {
-        let target = go_release_target();
+    fn release_source_matches_rust_release_repo() {
+        assert_eq!(RELEASE_REPO_OWNER, "nezha-rs");
+        assert_eq!(RELEASE_REPO_NAME, "nezha-rs");
+    }
+
+    #[test]
+    fn release_target_uses_installer_asset_os_arch_names() {
+        let target = rust_release_target();
         assert!(target.contains('_'));
         assert!(!target.contains("x86_64"));
         assert!(!target.contains("macos"));

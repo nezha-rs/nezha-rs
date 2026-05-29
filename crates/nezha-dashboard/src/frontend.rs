@@ -11,8 +11,7 @@ use include_dir::{Dir, include_dir};
 use serde::{Deserialize, Serialize};
 use zip::ZipArchive;
 
-const FRONTEND_TEMPLATES_YAML: &str =
-    include_str!("../assets/frontend-templates.yaml");
+const FRONTEND_TEMPLATES_YAML: &str = include_str!("../assets/frontend-templates.yaml");
 
 static FRONTEND_TEMPLATES: OnceLock<Vec<FrontendTemplate>> = OnceLock::new();
 static EMBEDDED_FRONTENDS: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../../static");
@@ -43,6 +42,12 @@ pub(crate) fn has_user_template(path: &str) -> bool {
     templates()
         .iter()
         .any(|template| !template.is_admin && template.path == path)
+}
+
+pub(crate) fn has_admin_template(path: &str) -> bool {
+    templates()
+        .iter()
+        .any(|template| template.is_admin && template.path == path)
 }
 
 pub(crate) fn embedded_asset(relative_path: &str) -> Option<&'static [u8]> {

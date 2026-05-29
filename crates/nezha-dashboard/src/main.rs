@@ -230,10 +230,11 @@ pub(crate) struct DashboardState {
     online_users: Mutex<HashMap<String, OnlineUser>>,
     blocked_online_ips: Mutex<HashSet<String>>,
     config_waiters: Mutex<HashMap<u64, oneshot::Sender<String>>>,
+    apply_config_waiters: Mutex<HashMap<u64, oneshot::Sender<(bool, String)>>>,
     pending_alert_trigger_tasks: Mutex<HashMap<u64, HashMap<u64, Vec<u64>>>>,
-    service_current_results: Mutex<HashMap<u64, Vec<bool>>>,
-    service_last_status: Mutex<HashMap<u64, u8>>,
-    service_tls_cert_cache: Mutex<HashMap<u64, String>>,
+    service_current_results: Mutex<HashMap<(u64, u64), Vec<bool>>>,
+    service_last_status: Mutex<HashMap<(u64, u64), u8>>,
+    service_tls_cert_cache: Mutex<HashMap<(u64, u64), String>>,
     geoip_db: PathBuf,
     next_task_id: AtomicU64,
 }
@@ -254,6 +255,7 @@ struct ServiceNotification {
     notifications: Vec<store::NotificationResource>,
     message: String,
     log_context: &'static str,
+    context: Option<notification::NotificationContext>,
 }
 
 #[tokio::main]
@@ -280,8 +282,7 @@ async fn main() -> Result<()> {
     let store = store::Store::open(&args.data)?;
     store.ensure_admin(&args.admin_username, &args.admin_password)?;
     let stored_settings = store.dashboard_settings()?;
-    let resolved_config =
-        resolve_dashboard_config(&args, &file_config, stored_settings.as_ref())?;
+    let resolved_config = resolve_dashboard_config(&args, &file_config, stored_settings.as_ref())?;
     match stored_settings {
         None => {
             let mut initial = resolved_config.initial_settings.clone();
@@ -326,6 +327,7 @@ async fn main() -> Result<()> {
             online_users: Mutex::new(HashMap::new()),
             blocked_online_ips: Mutex::new(HashSet::new()),
             config_waiters: Mutex::new(HashMap::new()),
+            apply_config_waiters: Mutex::new(HashMap::new()),
             pending_alert_trigger_tasks: Mutex::new(HashMap::new()),
             service_current_results: Mutex::new(HashMap::new()),
             service_last_status: Mutex::new(HashMap::new()),
@@ -363,9 +365,7 @@ async fn main() -> Result<()> {
     let grpc = async move {
         let mut builder = Server::builder();
         if let Some(tls) = grpc_tls {
-            builder = builder
-                .tls_config(tls)
-                .map_err(anyhow::Error::from)?;
+            builder = builder.tls_config(tls).map_err(anyhow::Error::from)?;
         }
         builder
             .add_service(NezhaServiceServer::new(service))
@@ -443,11 +443,7 @@ fn resolve_dashboard_config(
         .or_else(|| non_empty_opt(file.jwt_secret_key.clone()))
         .or_else(|| stored.and_then(|s| non_empty_opt(Some(s.jwt_secret.clone()))))
         .unwrap_or_else(|| generated_secret(128));
-    let jwt_timeout = args
-        .jwt_timeout
-        .or(file.jwt_timeout)
-        .unwrap_or(1)
-        .max(1);
+    let jwt_timeout = args.jwt_timeout.or(file.jwt_timeout).unwrap_or(1).max(1);
     let site_name = args
         .site_name
         .clone()
@@ -591,6 +587,7 @@ impl DashboardState {
             online_users: Mutex::new(HashMap::new()),
             blocked_online_ips: Mutex::new(HashSet::new()),
             config_waiters: Mutex::new(HashMap::new()),
+            apply_config_waiters: Mutex::new(HashMap::new()),
             pending_alert_trigger_tasks: Mutex::new(HashMap::new()),
             service_current_results: Mutex::new(HashMap::new()),
             service_last_status: Mutex::new(HashMap::new()),
@@ -661,6 +658,41 @@ impl DashboardState {
         }
     }
 
+    pub(crate) async fn apply_config_and_wait(
+        &self,
+        server_id: u64,
+        config: String,
+    ) -> Result<Option<(bool, String)>, String> {
+        let task = Task {
+            id: self.next_task_id.fetch_add(1, Ordering::Relaxed),
+            r#type: TaskType::ApplyConfig.as_u64(),
+            data: config,
+        };
+        let (tx, rx) = oneshot::channel();
+        self.apply_config_waiters
+            .lock()
+            .map_err(|_| "apply config waiter lock poisoned".to_string())?
+            .insert(task.id, tx);
+
+        if !self.send_task(server_id, task.clone()).await {
+            if let Ok(mut waiters) = self.apply_config_waiters.lock() {
+                waiters.remove(&task.id);
+            }
+            return Ok(None);
+        }
+
+        match time::timeout(std::time::Duration::from_secs(15), rx).await {
+            Ok(Ok(result)) => Ok(Some(result)),
+            Ok(Err(_)) => Err("apply config failed".to_string()),
+            Err(_) => {
+                if let Ok(mut waiters) = self.apply_config_waiters.lock() {
+                    waiters.remove(&task.id);
+                }
+                Err("operation timeout".to_string())
+            }
+        }
+    }
+
     pub(crate) fn add_online_user(&self, conn_id: String, user: OnlineUser) {
         if let Ok(mut users) = self.online_users.lock() {
             users.insert(conn_id, user);
@@ -703,6 +735,15 @@ impl DashboardState {
             blocked.insert(ip.clone());
         }
         users.retain(|_, user| !blocked.contains(&user.ip));
+    }
+
+    pub(crate) fn unblock_online_ips(&self, ips: &[String]) {
+        let Ok(mut blocked) = self.blocked_online_ips.lock() else {
+            return;
+        };
+        for ip in ips {
+            blocked.remove(ip);
+        }
     }
 
     pub(crate) fn online_ip_is_blocked(&self, ip: &str) -> bool {
@@ -783,6 +824,16 @@ impl DashboardState {
             return;
         }
 
+        if result.r#type == TaskType::ApplyConfig.as_u64() {
+            let Ok(mut waiters) = self.apply_config_waiters.lock() else {
+                return;
+            };
+            if let Some(waiter) = waiters.remove(&result.id) {
+                let _ = waiter.send((result.successful, result.data.clone()));
+            }
+            return;
+        }
+
         if result.r#type == TaskType::Command.as_u64() {
             let notification = {
                 let Ok(store) = self.store.lock() else {
@@ -797,10 +848,18 @@ impl DashboardState {
                             return None;
                         }
                         let message = cron_result_message(&cron.name, result);
+                        let context = store
+                            .list_servers()
+                            .ok()
+                            .and_then(|servers| {
+                                servers.into_iter().find(|server| server.id == server_id)
+                            })
+                            .as_ref()
+                            .map(notification::NotificationContext::for_public_server);
                         store
                             .notifications_for_group(cron.notification_group_id)
                             .ok()
-                            .map(|notifications| (notifications, message))
+                            .map(|notifications| (notifications, message, context))
                     }),
                     Ok(false) => None,
                     Err(err) => {
@@ -809,8 +868,13 @@ impl DashboardState {
                     }
                 }
             };
-            if let Some((notifications, message)) = notification {
-                let results = notification::send_notification_group(notifications, &message).await;
+            if let Some((notifications, message, context)) = notification {
+                let results = notification::send_notification_group_with_context(
+                    notifications,
+                    &message,
+                    context.as_ref(),
+                )
+                .await;
                 if let Ok(store) = self.store.lock() {
                     notification::record_dead_letters(&store, &message, &results);
                 }
@@ -852,7 +916,7 @@ impl DashboardState {
                 }
             };
             let Some((last_status, current_status, should_run_status_effects)) =
-                self.record_service_current_status(result.id, result.successful)
+                self.record_service_current_status(result.id, server_id, result.successful)
             else {
                 return;
             };
@@ -867,16 +931,17 @@ impl DashboardState {
                     );
                     Vec::new()
                 });
-            let server_name = store
+            let server = store
                 .list_servers()
                 .ok()
-                .and_then(|servers| {
-                    servers
-                        .into_iter()
-                        .find(|server| server.id == server_id)
-                        .map(|server| server.name)
-                })
+                .and_then(|servers| servers.into_iter().find(|server| server.id == server_id));
+            let server_name = server
+                .as_ref()
+                .map(|server| server.name.clone())
                 .unwrap_or_else(|| server_id.to_string());
+            let context = server
+                .as_ref()
+                .map(notification::NotificationContext::for_public_server);
             let trigger_owner_is_admin = store.user_is_admin(service.user_id).unwrap_or(false);
             let mut effects = ServiceResultEffects {
                 notifications: Vec::new(),
@@ -897,6 +962,7 @@ impl DashboardState {
                         result.data
                     ),
                     log_context: "service status",
+                    context: context.clone(),
                 });
             }
 
@@ -909,6 +975,7 @@ impl DashboardState {
                             service.name, result.delay, service.max_latency, server_name
                         ),
                         log_context: "service latency",
+                        context: context.clone(),
                     });
                 } else if service.min_latency > 0.0 && (result.delay as f64) < service.min_latency {
                     effects.notifications.push(ServiceNotification {
@@ -918,6 +985,7 @@ impl DashboardState {
                             service.name, result.delay, service.min_latency, server_name
                         ),
                         log_context: "service latency",
+                        context: context.clone(),
                     });
                 }
             }
@@ -925,9 +993,11 @@ impl DashboardState {
             if service.notify {
                 effects.notifications.extend(self.service_tls_notifications(
                     service.id,
+                    server_id,
                     &service.name,
                     notifications.clone(),
                     &result.data,
+                    context.clone(),
                 ));
             }
 
@@ -956,9 +1026,10 @@ impl DashboardState {
         };
 
         for notification in effects.notifications {
-            let results = notification::send_notification_group(
+            let results = notification::send_notification_group_with_context(
                 notification.notifications,
                 &notification.message,
+                notification.context.as_ref(),
             )
             .await;
             if let Ok(store) = self.store.lock() {
@@ -983,13 +1054,15 @@ impl DashboardState {
     fn record_service_current_status(
         &self,
         service_id: u64,
+        server_id: u64,
         successful: bool,
     ) -> Option<(u8, u8, bool)> {
+        let key = (service_id, server_id);
         let current_status = {
             let Ok(mut results) = self.service_current_results.lock() else {
                 return None;
             };
-            let samples = results.entry(service_id).or_default();
+            let samples = results.entry(key).or_default();
             samples.push(successful);
             if samples.len() > SERVICE_CURRENT_STATUS_SIZE {
                 let remove = samples.len() - SERVICE_CURRENT_STATUS_SIZE;
@@ -997,20 +1070,17 @@ impl DashboardState {
             }
             let total = samples.len() as u64;
             let up = samples.iter().filter(|sample| **sample).count() as u64;
-            let up_percent = if total == 0 { 0 } else { up * 100 / total };
-            service_status_code(up_percent)
+            service_status_code_from_samples(total, up)
         };
 
         let Ok(mut last_statuses) = self.service_last_status.lock() else {
             return None;
         };
-        let last_status = *last_statuses
-            .entry(service_id)
-            .or_insert(SERVICE_STATUS_UNSET);
+        let last_status = *last_statuses.entry(key).or_insert(SERVICE_STATUS_UNSET);
         let should_run_status_effects =
             current_status == SERVICE_STATUS_DOWN || current_status != last_status;
         if should_run_status_effects {
-            last_statuses.insert(service_id, current_status);
+            last_statuses.insert(key, current_status);
         }
         Some((last_status, current_status, should_run_status_effects))
     }
@@ -1018,9 +1088,11 @@ impl DashboardState {
     fn service_tls_notifications(
         &self,
         service_id: u64,
+        server_id: u64,
         service_name: &str,
         notifications: Vec<store::NotificationResource>,
         data: &str,
+        context: Option<notification::NotificationContext>,
     ) -> Vec<ServiceNotification> {
         let Some((new_issuer, new_expires)) = parse_tls_certificate_data(data) else {
             return Vec::new();
@@ -1031,7 +1103,7 @@ impl DashboardState {
             Err(_) => return Vec::new(),
         };
         let old = cache
-            .entry(service_id)
+            .entry((service_id, server_id))
             .or_insert_with(|| data.to_string())
             .clone();
 
@@ -1044,6 +1116,7 @@ impl DashboardState {
                     format_tls_time(new_expires)
                 ),
                 log_context: "service tls",
+                context: context.clone(),
             });
         }
 
@@ -1060,9 +1133,10 @@ impl DashboardState {
                         format_tls_time(new_expires)
                     ),
                     log_context: "service tls",
+                    context: context.clone(),
                 });
             }
-            cache.insert(service_id, data.to_string());
+            cache.insert((service_id, server_id), data.to_string());
         }
         messages
     }
@@ -1092,8 +1166,10 @@ impl DashboardState {
                 }
             }
         }
-        if let Err(err) = self.persist_pending_task(server_id, &task) {
-            error!(%err, server_id, "failed to persist pending task");
+        if task_type_can_persist(task.r#type) {
+            if let Err(err) = self.persist_pending_task(server_id, &task) {
+                error!(%err, server_id, "failed to persist pending task");
+            }
         }
         false
     }
@@ -1104,6 +1180,20 @@ impl DashboardState {
             .lock()
             .map_err(|_| anyhow::anyhow!("store lock poisoned"))?;
         store.enqueue_pending_task(server_id, task.id, task.r#type, &task.data)
+    }
+
+    pub(crate) async fn remove_cached_servers_by_id(&self, ids: &[u64]) {
+        if ids.is_empty() {
+            return;
+        }
+        let mut servers = self.servers.write().await;
+        servers.retain(|_, server| !ids.contains(&server.id));
+        drop(servers);
+
+        let mut task_senders = self.task_senders.write().await;
+        for id in ids {
+            task_senders.remove(id);
+        }
     }
 }
 
@@ -1141,13 +1231,32 @@ impl DashboardService {
     }
 
     async fn ensure_server(&self, agent: AuthenticatedAgent) -> Result<ServerRecord, Status> {
-        if let Some(server) = self.state.servers.read().await.get(&agent.uuid) {
+        let cached = { self.state.servers.read().await.get(&agent.uuid).cloned() };
+        if let Some(server) = cached {
             if agent.user_id != 0 && server.user_id != agent.user_id {
-                return Err(Status::permission_denied(
-                    "client UUID does not belong to the agent secret owner",
-                ));
+                let stored = self
+                    .state
+                    .store
+                    .lock()
+                    .map_err(|_| Status::internal("store lock poisoned"))?
+                    .ensure_server_for_user(agent.uuid, agent.user_id)
+                    .map_err(store_error_status)?;
+                let updated = ServerRecord {
+                    id: stored.id,
+                    user_id: stored.user_id,
+                    host: stored.host.clone(),
+                    state: stored.state.clone(),
+                    geoip: stored.geoip.clone(),
+                    last_active_unix: stored.last_active_unix,
+                };
+                self.state
+                    .servers
+                    .write()
+                    .await
+                    .insert(agent.uuid, updated.clone());
+                return Ok(updated);
             }
-            return Ok(server.clone());
+            return Ok(server);
         }
 
         let stored = self
@@ -1283,7 +1392,10 @@ impl NezhaService for DashboardService {
                 Vec::new()
             }),
             Err(_) => {
-                error!(server_id = server.id, "store lock poisoned while draining pending tasks");
+                error!(
+                    server_id = server.id,
+                    "store lock poisoned while draining pending tasks"
+                );
                 Vec::new()
             }
         };
@@ -1378,6 +1490,7 @@ impl NezhaService for DashboardService {
             .take_agent_receiver()
             .await
             .ok_or_else(|| Status::already_exists("agent stream already connected"))?;
+        session.mark_agent_connected();
         let to_user_session = session.clone();
         let stream_id_for_task = stream_id.clone();
         tokio::spawn(async move {
@@ -1452,12 +1565,16 @@ impl NezhaService for DashboardService {
                 .map_err(|err| Status::internal(err.to_string()))?
                 .unwrap_or_default();
             let dns_servers = settings.dns_servers.clone();
+            let public_server = store
+                .list_servers()
+                .map_err(store_error_status)?
+                .into_iter()
+                .find(|server| server.id == stored.id);
             let ddns_update = if !current_ip.is_empty() && current_ip != previous_ip {
-                store
-                    .list_servers()
-                    .map_err(store_error_status)?
-                    .into_iter()
-                    .find(|server| server.id == stored.id && server.enable_ddns)
+                public_server
+                    .as_ref()
+                    .filter(|server| server.enable_ddns)
+                    .cloned()
                     .map(|server| {
                         let profiles = store.ddns_profiles_for_server(server.id)?;
                         Ok((server, profiles, dns_servers.clone()))
@@ -1477,11 +1594,15 @@ impl NezhaService for DashboardService {
                     "[IP Changed] server {}: {} -> {}",
                     stored.id, previous_ip, current_ip
                 );
+                let context = public_server
+                    .as_ref()
+                    .map(notification::NotificationContext::for_public_server);
                 Some((
                     store
                         .notifications_for_group(settings.ip_change_notification_group_id)
                         .map_err(|err| Status::internal(err.to_string()))?,
                     message,
+                    context,
                 ))
             } else {
                 None
@@ -1493,8 +1614,13 @@ impl NezhaService for DashboardService {
             server.geoip = stored.geoip;
             server.last_active_unix = stored.last_active_unix;
         }
-        if let Some((notifications, message)) = ip_change_notification {
-            let results = notification::send_notification_group(notifications, &message).await;
+        if let Some((notifications, message, context)) = ip_change_notification {
+            let results = notification::send_notification_group_with_context(
+                notifications,
+                &message,
+                context.as_ref(),
+            )
+            .await;
             if let Ok(store) = self.state.store.lock() {
                 notification::record_dead_letters(&store, &message, &results);
             }
@@ -1581,10 +1707,16 @@ fn geoip_lookup_ip(geoip: &GeoIp) -> Option<IpAddr> {
     raw.parse().ok()
 }
 
-fn service_status_code(percent: u64) -> u8 {
-    if percent == 0 {
+fn service_status_code_from_samples(total: u64, up: u64) -> u8 {
+    if total == 0 {
         SERVICE_STATUS_NO_DATA
-    } else if percent > 95 {
+    } else {
+        service_status_code(up * 100 / total)
+    }
+}
+
+fn service_status_code(percent: u64) -> u8 {
+    if percent > 95 {
         SERVICE_STATUS_GOOD
     } else if percent > 80 {
         SERVICE_STATUS_LOW_AVAILABILITY
@@ -1693,6 +1825,13 @@ pub(crate) fn is_service_monitor_task(task_type: u64) -> bool {
     )
 }
 
+fn task_type_can_persist(task_type: u64) -> bool {
+    matches!(
+        TaskType::from_u64(task_type),
+        Some(TaskType::Command | TaskType::Upgrade | TaskType::ApplyConfig)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1780,6 +1919,56 @@ oauth2:
     }
 
     #[tokio::test]
+    async fn remove_cached_servers_clears_server_and_task_sender() {
+        let state = DashboardState::new_for_test();
+        let uuid = Uuid::new_v4();
+        state.servers.write().await.insert(
+            uuid,
+            ServerRecord {
+                id: 42,
+                user_id: 1,
+                host: None,
+                state: None,
+                geoip: None,
+                last_active_unix: 0,
+            },
+        );
+        let (tx, _rx) = mpsc::channel(1);
+        state.task_senders.write().await.insert(42, tx);
+
+        state.remove_cached_servers_by_id(&[42]).await;
+
+        assert!(!state.servers.read().await.contains_key(&uuid));
+        assert!(!state.task_senders.read().await.contains_key(&42));
+    }
+
+    #[tokio::test]
+    async fn offline_dispatch_persists_only_replayable_tasks() {
+        let state = DashboardState::new_for_test();
+
+        assert!(
+            !state
+                .dispatch_task(42, TaskType::Command, "uptime".to_string())
+                .await
+        );
+        assert!(
+            !state
+                .dispatch_task(42, TaskType::TerminalGrpc, "{}".to_string())
+                .await
+        );
+        assert!(
+            !state
+                .dispatch_task(42, TaskType::HttpGet, "https://example.com".to_string())
+                .await
+        );
+
+        let pending = state.store.lock().unwrap().drain_pending_tasks(42).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].task_type, TaskType::Command.as_u64());
+        assert_eq!(pending[0].data, "uptime");
+    }
+
+    #[tokio::test]
     async fn request_config_completes_from_task_result() {
         let state = Arc::new(DashboardState::new_for_test());
         let (tx, mut rx) = mpsc::channel(1);
@@ -1806,6 +1995,38 @@ oauth2:
         assert_eq!(
             waiter.await.unwrap().unwrap(),
             Some("agent-config".to_string())
+        );
+    }
+
+    #[test]
+    fn service_current_status_treats_zero_percent_as_down() {
+        let state = DashboardState::new_for_test();
+
+        assert_eq!(
+            state.record_service_current_status(1, 10, false),
+            Some((SERVICE_STATUS_UNSET, SERVICE_STATUS_DOWN, true))
+        );
+        assert_eq!(
+            state.record_service_current_status(1, 10, false),
+            Some((SERVICE_STATUS_DOWN, SERVICE_STATUS_DOWN, true))
+        );
+        assert_eq!(
+            service_status_code_from_samples(0, 0),
+            SERVICE_STATUS_NO_DATA
+        );
+    }
+
+    #[test]
+    fn service_current_status_isolated_by_server() {
+        let state = DashboardState::new_for_test();
+
+        assert_eq!(
+            state.record_service_current_status(1, 10, false),
+            Some((SERVICE_STATUS_UNSET, SERVICE_STATUS_DOWN, true))
+        );
+        assert_eq!(
+            state.record_service_current_status(1, 20, true),
+            Some((SERVICE_STATUS_UNSET, SERVICE_STATUS_GOOD, true))
         );
     }
 
@@ -1948,6 +2169,19 @@ oauth2:
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
+
+        {
+            let store = state.store.lock().unwrap();
+            store.move_servers(&[server.id], bob_id).unwrap();
+        }
+        let moved = service
+            .ensure_server(AuthenticatedAgent {
+                uuid,
+                user_id: bob_id,
+            })
+            .await
+            .unwrap();
+        assert_eq!(moved.user_id, bob_id);
     }
 
     fn agent_metadata(secret: &str, uuid: Uuid) -> MetadataMap {
