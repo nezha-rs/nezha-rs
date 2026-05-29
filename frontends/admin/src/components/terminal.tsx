@@ -89,7 +89,7 @@ export const XtermComponent = forwardRef<HTMLDivElement, XtermProps & JSX.Intrin
         const terminalRef = useRef<Terminal | null>(null)
         const wsRef = useRef<WebSocket | null>(null)
         const pendingInputRef = useRef<(string | Uint8Array)[]>([])
-        const textEncoderRef = useRef(new TextEncoder())
+        const terminalActiveRef = useRef(false)
 
         useImperativeHandle(ref, () => {
             return {
@@ -104,15 +104,13 @@ export const XtermComponent = forwardRef<HTMLDivElement, XtermProps & JSX.Intrin
         const sendResize = useRef(false)
 
         const sendTerminalData = useCallback((data: string | Uint8Array) => {
-            const payload =
-                typeof data === "string" ? textEncoderRef.current.encode(data) : data
             const ws = wsRef.current
             if (ws?.readyState === WebSocket.OPEN) {
-                ws.send(payload)
+                ws.send(data)
                 return
             }
 
-            pendingInputRef.current.push(payload)
+            pendingInputRef.current.push(data)
         }, [])
 
         const flushPendingInput = useCallback(() => {
@@ -189,15 +187,37 @@ export const XtermComponent = forwardRef<HTMLDivElement, XtermProps & JSX.Intrin
             window.addEventListener("resize", onResize)
 
             const focusTerminal = () => {
+                terminalActiveRef.current = true
                 container.focus({ preventScroll: true })
                 terminal.focus()
             }
+            const deactivateTerminal = (event: FocusEvent) => {
+                const target = event.target
+                if (target instanceof Node && container.contains(target)) return
+
+                terminalActiveRef.current = false
+            }
+            const shouldHandleTerminalInput = (event: Event) => {
+                const target = event.target
+                if (target instanceof Node && container.contains(target)) return true
+
+                const activeElement = document.activeElement
+                return (
+                    terminalActiveRef.current
+                    && (activeElement === null
+                        || activeElement === document.body
+                        || activeElement === document.documentElement)
+                )
+            }
             const keydownHandler = (event: KeyboardEvent) => {
+                if (!shouldHandleTerminalInput(event)) return
+
                 const data = keyboardEventToTerminalData(event)
                 if (data === undefined) return
 
                 event.preventDefault()
                 event.stopPropagation()
+                event.stopImmediatePropagation()
                 sendTerminalData(data)
             }
             const dataDisposable = terminal.onData((data) => {
@@ -211,19 +231,22 @@ export const XtermComponent = forwardRef<HTMLDivElement, XtermProps & JSX.Intrin
                 sendTerminalData(bytes)
             })
             const pasteHandler = (event: ClipboardEvent) => {
+                if (!shouldHandleTerminalInput(event)) return
+
                 const text = event.clipboardData?.getData("text/plain")
                 if (!text) return
 
                 event.preventDefault()
                 event.stopPropagation()
+                event.stopImmediatePropagation()
                 sendTerminalData(text.replace(/\r?\n/g, "\r"))
                 terminal.focus()
             }
+            focusTerminal()
             container.addEventListener("pointerdown", focusTerminal)
-            container.addEventListener("keydown", keydownHandler, true)
-            container.addEventListener("paste", pasteHandler)
-            document.addEventListener("keydown", keydownHandler, true)
-            document.addEventListener("paste", pasteHandler, true)
+            window.addEventListener("focusin", deactivateTerminal)
+            window.addEventListener("keydown", keydownHandler, true)
+            window.addEventListener("paste", pasteHandler, true)
 
             ws.onmessage = async (event) => {
                 const data = event.data
@@ -260,10 +283,9 @@ export const XtermComponent = forwardRef<HTMLDivElement, XtermProps & JSX.Intrin
             return () => {
                 window.removeEventListener("resize", onResize)
                 container.removeEventListener("pointerdown", focusTerminal)
-                container.removeEventListener("keydown", keydownHandler, true)
-                container.removeEventListener("paste", pasteHandler)
-                document.removeEventListener("keydown", keydownHandler, true)
-                document.removeEventListener("paste", pasteHandler, true)
+                window.removeEventListener("focusin", deactivateTerminal)
+                window.removeEventListener("keydown", keydownHandler, true)
+                window.removeEventListener("paste", pasteHandler, true)
                 dataDisposable.dispose()
                 binaryDisposable.dispose()
                 ws.onmessage = null
