@@ -9,7 +9,6 @@ import {
 } from "@/components/ui/alert-dialog"
 import useTerminal from "@/hooks/useTerminal"
 import { sleep } from "@/lib/utils"
-import { AttachAddon } from "@xterm/addon-attach"
 import { FitAddon } from "@xterm/addon-fit"
 import { Terminal } from "@xterm/xterm"
 import "@xterm/xterm/css/xterm.css"
@@ -41,6 +40,7 @@ export const XtermComponent = forwardRef<HTMLDivElement, XtermProps & JSX.Intrin
         const terminalIdRef = useRef<HTMLDivElement>(null)
         const terminalRef = useRef<Terminal | null>(null)
         const wsRef = useRef<WebSocket | null>(null)
+        const pendingInputRef = useRef<(string | Uint8Array)[]>([])
 
         useImperativeHandle(ref, () => {
             return {
@@ -54,6 +54,26 @@ export const XtermComponent = forwardRef<HTMLDivElement, XtermProps & JSX.Intrin
         const fitAddon = useRef(new FitAddon()).current
         const sendResize = useRef(false)
 
+        const sendTerminalData = useCallback((data: string | Uint8Array) => {
+            const ws = wsRef.current
+            if (ws?.readyState === WebSocket.OPEN) {
+                ws.send(data)
+                return
+            }
+
+            pendingInputRef.current.push(data)
+        }, [])
+
+        const flushPendingInput = useCallback(() => {
+            const ws = wsRef.current
+            if (ws?.readyState !== WebSocket.OPEN) return
+
+            const pendingInput = pendingInputRef.current.splice(0)
+            for (const data of pendingInput) {
+                ws.send(data)
+            }
+        }, [])
+
         const doResize = useCallback(() => {
             if (!terminalIdRef.current) return
 
@@ -62,7 +82,7 @@ export const XtermComponent = forwardRef<HTMLDivElement, XtermProps & JSX.Intrin
             const dimensions = fitAddon.proposeDimensions()
 
             if (dimensions) {
-                const prefix = new Int8Array([1])
+                const prefix = new Uint8Array([1])
                 const resizeMessage = new TextEncoder().encode(
                     JSON.stringify({
                         Rows: dimensions.rows,
@@ -70,13 +90,13 @@ export const XtermComponent = forwardRef<HTMLDivElement, XtermProps & JSX.Intrin
                     }),
                 )
 
-                const msg = new Int8Array(prefix.length + resizeMessage.length)
+                const msg = new Uint8Array(prefix.length + resizeMessage.length)
                 msg.set(prefix)
                 msg.set(resizeMessage, prefix.length)
 
-                wsRef.current?.send(msg)
+                sendTerminalData(msg)
             }
-        }, [fitAddon])
+        }, [fitAddon, sendTerminalData])
 
         const onResize = useCallback(async () => {
             if (sendResize.current) return
@@ -108,13 +128,40 @@ export const XtermComponent = forwardRef<HTMLDivElement, XtermProps & JSX.Intrin
             terminalRef.current = terminal
             wsRef.current = ws
 
-            const attachAddon = new AttachAddon(ws)
-            terminal.loadAddon(attachAddon)
             terminal.loadAddon(fitAddon)
             terminal.open(container)
+            terminal.focus()
+            requestAnimationFrame(() => {
+                fitAddon.fit()
+                terminal.focus()
+            })
             window.addEventListener("resize", onResize)
 
+            const focusTerminal = () => terminal.focus()
+            const dataDisposable = terminal.onData((data) => {
+                sendTerminalData(data)
+            })
+            const binaryDisposable = terminal.onBinary((data) => {
+                const bytes = new Uint8Array(data.length)
+                for (let index = 0; index < data.length; index += 1) {
+                    bytes[index] = data.charCodeAt(index) & 0xff
+                }
+                sendTerminalData(bytes)
+            })
+            const pasteHandler = (event: ClipboardEvent) => {
+                const text = event.clipboardData?.getData("text/plain")
+                if (!text) return
+
+                event.preventDefault()
+                terminal.paste(text)
+                terminal.focus()
+            }
+            container.addEventListener("pointerdown", focusTerminal)
+            container.addEventListener("paste", pasteHandler)
+
             ws.onopen = () => {
+                flushPendingInput()
+                terminal.focus()
                 onResize()
             }
             ws.onclose = () => {
@@ -130,15 +177,20 @@ export const XtermComponent = forwardRef<HTMLDivElement, XtermProps & JSX.Intrin
 
             return () => {
                 window.removeEventListener("resize", onResize)
+                container.removeEventListener("pointerdown", focusTerminal)
+                container.removeEventListener("paste", pasteHandler)
+                dataDisposable.dispose()
+                binaryDisposable.dispose()
                 ws.onopen = null
                 ws.onclose = null
                 ws.onerror = null
                 ws.close()
                 terminal.dispose()
+                pendingInputRef.current = []
                 if (wsRef.current === ws) wsRef.current = null
                 if (terminalRef.current === terminal) terminalRef.current = null
             }
-        }, [fitAddon, onResize, setClose, wsUrl])
+        }, [fitAddon, flushPendingInput, onResize, sendTerminalData, setClose, wsUrl])
 
         return <div ref={terminalIdRef} {...props} />
     },
@@ -166,7 +218,7 @@ export const TerminalPage = () => {
             {terminal?.session_id ? (
                 <XtermComponent
                     ref={terminalIdRef}
-                    className="max-h-[60%] mb-5 overflow-auto"
+                    className="h-[calc(100dvh-9rem)] min-h-[320px] mb-5 overflow-hidden rounded-md border bg-black"
                     wsUrl={`/api/v1/ws/terminal/${terminal?.session_id}`}
                     setClose={setOpen}
                 />
