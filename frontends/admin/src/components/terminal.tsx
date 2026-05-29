@@ -222,6 +222,8 @@ export const XtermComponent = forwardRef<HTMLDivElement, XtermProps & JSX.Intrin
             container.addEventListener("pointerdown", focusTerminal)
             container.addEventListener("keydown", keydownHandler, true)
             container.addEventListener("paste", pasteHandler)
+            document.addEventListener("keydown", keydownHandler, true)
+            document.addEventListener("paste", pasteHandler, true)
 
             ws.onmessage = async (event) => {
                 const data = event.data
@@ -260,6 +262,8 @@ export const XtermComponent = forwardRef<HTMLDivElement, XtermProps & JSX.Intrin
                 container.removeEventListener("pointerdown", focusTerminal)
                 container.removeEventListener("keydown", keydownHandler, true)
                 container.removeEventListener("paste", pasteHandler)
+                document.removeEventListener("keydown", keydownHandler, true)
+                document.removeEventListener("paste", pasteHandler, true)
                 dataDisposable.dispose()
                 binaryDisposable.dispose()
                 ws.onmessage = null
